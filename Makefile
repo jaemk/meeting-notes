@@ -12,9 +12,11 @@ OUTPUT ?= output/$(basename $(notdir $(INPUT)))
 TRANSCRIPT ?= $(OUTPUT).timestamped.txt
 
 # Extra flags: make ARGS="--model large-v3 --backend openai"
+# -c 1 keeps every decode down to about a minute, which is what stops Whisper
+# looping. transcribe passes it on to its own repair pass; `fix` sets the same
+# thing explicitly so a standalone repair slices its windows identically.
 ARGS     ?= --model large-v2 -c 1 -l en
-# repair.py takes no --chunk-size, so `fix` gets its own defaults
-FIX_ARGS ?= --model large-v2 -l en
+FIX_ARGS ?= --model large-v2 -c 1 -l en
 
 .PHONY: all transcribe check fix test setup clean distclean
 

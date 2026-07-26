@@ -48,6 +48,10 @@ class RepairOptions:
     fallback_model: str = "large-v3"
     language: Optional[str] = None
     pad: float = 15.0
+    # A window longer than this is decoded in slices cut at silence, the same
+    # way a whole file is — one long decode is what makes Whisper loop, and a
+    # repair window is by definition somewhere it already has.
+    chunk_mins: int = T.DEFAULT_CHUNK_MINS
     join_within: float = 5.0
     strict: bool = False
     passes: int = 2
@@ -196,6 +200,7 @@ def attempt_window(audio_path, window, opts, attempt):
     segs = T.transcribe_window(
         audio_path, window, opts.backend, attempt.get("model", opts.model),
         opts.language, attempt.get("pad", opts.pad), condition_on_prev=False,
+        chunk_mins=opts.chunk_mins,
     )
     problems = []
     if T.find_repeats(segs):
@@ -424,6 +429,11 @@ are re-decoded. Either way it is the same splice-and-recheck path.
     r.add_argument("--language", "-l", default=None)
     r.add_argument("--pad", type=float, default=15.0,
                    help="Context seconds decoded either side of a window (default: 15)")
+    r.add_argument("--chunk-size", "-c", type=int, default=T.DEFAULT_CHUNK_MINS,
+                   metavar="MINUTES",
+                   help=f"Slice windows longer than this and decode them a piece "
+                        f"at a time, cut at silence, as transcribe.py does with a "
+                        f"whole file (default: {T.DEFAULT_CHUNK_MINS})")
     r.add_argument("--join-within", type=float, default=5.0,
                    help="Coalesce defects closer than this into one window (default: 5)")
     r.add_argument("--output", "-o", default=None, help="Output stem")
@@ -461,12 +471,12 @@ are re-decoded. Either way it is the same splice-and-recheck path.
     opts = RepairOptions(
         backend=T.resolve_backend(args.backend), model=args.model,
         fallback_model=args.fallback_model, language=args.language,
-        pad=args.pad, join_within=args.join_within, strict=args.strict,
-        passes=args.passes, min_run=args.min_run, min_gap=args.min_gap,
-        check_audio=args.check_audio,
+        pad=args.pad, chunk_mins=args.chunk_size, join_within=args.join_within,
+        strict=args.strict, passes=args.passes, min_run=args.min_run,
+        min_gap=args.min_gap, check_audio=args.check_audio,
     )
     print(f"Backend:  {opts.backend}  model={opts.model} "
-          f"(fallback {opts.fallback_model})")
+          f"(fallback {opts.fallback_model})  chunk={opts.chunk_mins}min")
 
     segments, report, defects = diagnose_repair_verify(
         args.audio, segments, opts, windows=sorted(args.window or []) or None,

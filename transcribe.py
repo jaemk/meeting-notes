@@ -54,6 +54,11 @@ MLX_MODEL_MAP = {
 
 BACKENDS = ["auto", "mlx", "openai"]
 
+# Longest stretch handed to Whisper in one go, whether that is a slice of a
+# whole file or a slice of a repair window. Both paths chunk the same way, so
+# they share the default and repair.py takes the same -c flag.
+DEFAULT_CHUNK_MINS = 5
+
 
 # ── Backend selection ──────────────────────────────────────────────────────────
 
@@ -138,34 +143,54 @@ def get_duration(audio_path):
     return float(json.loads(r.stdout)["format"]["duration"])
 
 
-def find_split_points(audio_path, chunk_secs, duration):
+def silence_ends(audio_path, start=None, dur=None):
     """
-    Run silence detection and return split timestamps that fall near each
-    chunk_secs boundary. Falls back to a hard cut if no silence is nearby.
+    Timestamps where a silence of 0.3s+ ends, in absolute file time. With
+    `start`/`dur` only that stretch is scanned — ffmpeg reports times relative
+    to the seek point, so they are shifted back onto the file's own clock.
     """
-    print("detecting moments of silence")
-    r = subprocess.run(
-        ["ffmpeg", "-i", str(audio_path),
-         "-af", "silencedetect=noise=-35dB:d=0.3",
-         "-f", "null", "-"],
-        capture_output=True, text=True,
-    )
-    silence_ends = [
-        float(m.group(1))
-        for m in re.finditer(r"silence_end: ([\d.]+)", r.stderr)
-    ]
-    print(f"found {len(silence_ends)} moments of silence")
+    cmd = ["ffmpeg"]
+    if start is not None:
+        cmd += ["-ss", str(start)]
+    if dur is not None:
+        cmd += ["-t", str(dur)]
+    cmd += ["-i", str(audio_path),
+            "-af", "silencedetect=noise=-35dB:d=0.3", "-f", "null", "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    base = start or 0.0
+    return [base + float(m.group(1))
+            for m in re.finditer(r"silence_end: ([\d.]+)", r.stderr)]
 
-    splits = [0.0]
-    target = chunk_secs
-    while target < duration - chunk_secs * 0.2:  # avoid a tiny tail chunk
-        nearby = [t for t in silence_ends if t > splits[-1] and abs(t - target) < 90]
+
+def chunk_boundaries(start, end, chunk_secs, silences, tolerance, verbose=False):
+    """
+    Cut [start, end] into pieces of about chunk_secs, landing each cut on the
+    nearest silence within `tolerance` seconds of the target and falling back
+    to a hard cut when there is none nearby. Returns the boundaries including
+    both ends, so [a, b, c] means two chunks.
+    """
+    splits = [start]
+    target = start + chunk_secs
+    while target < end - chunk_secs * 0.2:  # avoid a tiny tail chunk
+        nearby = [t for t in silences
+                  if t > splits[-1] and abs(t - target) < tolerance]
         best = min(nearby, key=lambda t: abs(t - target)) if nearby else target
         splits.append(best)
         target = best + chunk_secs
-        print(f"chunk boundary at {best/60:.1f} min (next target {target/60:.1f} min)")
-    splits.append(duration)
+        if verbose:
+            print(f"chunk boundary at {best/60:.1f} min "
+                  f"(next target {target/60:.1f} min)")
+    splits.append(end)
     return splits
+
+
+def find_split_points(audio_path, chunk_secs, duration):
+    """Chunk boundaries for a whole file."""
+    print("detecting moments of silence")
+    silences = silence_ends(audio_path)
+    print(f"found {len(silences)} moments of silence")
+    return chunk_boundaries(0.0, duration, chunk_secs, silences,
+                            tolerance=90, verbose=True)
 
 
 def parse_time(s):
@@ -369,37 +394,82 @@ def snap_window(segments, window):
             max(end, max(s["end"] for s in touched)))
 
 
-def transcribe_window(audio_path, window, backend, model_name, language,
-                      pad, condition_on_prev=False):
+def window_slices(audio_path, start, end, chunk_secs):
     """
-    Re-transcribe a single [start, end) window. `pad` seconds of extra audio
-    are decoded on each side to give Whisper acoustic context, then dropped
-    so the returned segments stay inside the window.
+    Split a repair window the same way a whole file is split: pieces of about
+    chunk_secs, cut at silence. A long single decode is exactly the condition
+    that makes Whisper loop, and a repair window is somewhere it already has.
+    Windows at or under one chunk are left alone — most are — so the common
+    case costs no extra silence detection.
     """
-    start, end = window
-    duration = get_duration(audio_path)
-    dec_start = max(0.0, start - pad)
-    dec_end = min(duration, end + pad)
+    if end - start <= chunk_secs * 1.1:
+        return [start, end]
+    # Tighter than the whole-file tolerance: this stretch is known to decode
+    # badly, so a slice that drifts far past chunk_secs defeats the point.
+    return chunk_boundaries(start, end, chunk_secs,
+                            silence_ends(audio_path, start, end - start),
+                            tolerance=min(90.0, chunk_secs * 0.5))
 
+
+def _decode_span(audio_path, span, duration, backend, model_name, language,
+                 pad_before, pad_after, condition_on_prev):
+    """Decode [a, b] with context either side, on file time."""
+    a, b = span
+    dec_start = max(0.0, a - pad_before)
+    dec_end = min(duration, b + pad_after)
     with tempfile.TemporaryDirectory() as tmp:
         wav = Path(tmp) / "window.wav"
+        padded = dec_end - dec_start - (b - a)
+        pad_note = f" incl. {padded:.0f}s pad" if padded >= 0.5 else ""
         print(f"  extracting {fmt_time(dec_start)}–{fmt_time(dec_end)} "
-              f"({dec_end - dec_start:.0f}s incl. {pad:.0f}s pad)")
+              f"({dec_end - dec_start:.0f}s{pad_note})")
         extract_chunk(audio_path, dec_start, dec_end - dec_start, wav)
 
         t0 = time.time()
         result = _run_backend(wav, backend, model_name, language, {}, condition_on_prev)
         print(f"  decoded in {time.time() - t0:.0f}s")
 
-    shifted = [{"start": seg["start"] + dec_start, "end": seg["end"] + dec_start,
-                "text": seg["text"].strip()}
-               for seg in result.get("segments", [])]
+    return [{"start": seg["start"] + dec_start, "end": seg["end"] + dec_start,
+             "text": seg["text"].strip()}
+            for seg in result.get("segments", [])]
+
+
+def transcribe_window(audio_path, window, backend, model_name, language,
+                      pad, condition_on_prev=False,
+                      chunk_mins=DEFAULT_CHUNK_MINS):
+    """
+    Re-transcribe a single [start, end) window. `pad` seconds of extra audio
+    are decoded on each side to give Whisper acoustic context, then dropped
+    so the returned segments stay inside the window. Anything longer than
+    chunk_mins is decoded in slices, cut at silence, exactly as a whole file is.
+    """
+    start, end = window
+    duration = get_duration(audio_path)
+    points = window_slices(audio_path, start, end, chunk_mins * 60)
+    if len(points) > 2:
+        print(f"  {end - start:.0f}s window — decoding in {len(points) - 1} "
+              f"slices of ~{chunk_mins} min")
+
+    # Each slice keeps the segments whose midpoint falls in it, so the union is
+    # the same set a single decode would have kept — just assembled piecewise.
+    # Padding goes on the outer edges only: an internal seam is a hard cut at
+    # silence, as a chunk boundary is for a whole file. Padding across a seam
+    # would let one slice transcribe the next one's opening words too, and both
+    # copies would be spliced in.
+    last = len(points) - 2
+    shifted, kept = [], []
+    for i, span in enumerate(zip(points[:-1], points[1:])):
+        segs = _decode_span(audio_path, span, duration, backend, model_name,
+                            language, pad if i == 0 else 0.0,
+                            pad if i == last else 0.0, condition_on_prev)
+        shifted += segs
+        kept += [dict(s) for s in segs
+                 if span[0] <= (s["start"] + s["end"]) / 2 < span[1]]
 
     def inside(seg):
         mid = (seg["start"] + seg["end"]) / 2
         return start <= mid < end
 
-    kept = [dict(s) for s in shifted if inside(s)]
     # A segment straddling the window edge has its midpoint in the padding and
     # gets dropped — but the old segments there were already spliced out, so
     # that speech would vanish. Pull such a segment back in if it is the only
@@ -544,9 +614,11 @@ use repair.py to run that cycle against a transcript you already have.
     parser.add_argument(
         "--chunk-size", "-c",
         type=int,
-        default=5,
+        default=DEFAULT_CHUNK_MINS,
         metavar="MINUTES",
-        help="Max chunk length in minutes; splits at silence (default: 8)",
+        help=f"Max chunk length in minutes; splits at silence "
+             f"(default: {DEFAULT_CHUNK_MINS}). Also used to slice any window "
+             f"the repair pass re-decodes.",
     )
     parser.add_argument(
         "--output", "-o",
@@ -622,6 +694,10 @@ use repair.py to run that cycle against a transcript you already have.
             backend=backend,
             model=args.repair_model or args.model,
             language=args.language,
+            # Repair windows are sliced the same way this run's chunks were, so
+            # the pass that cleans up a loop cannot re-create one by decoding a
+            # longer stretch than the transcription itself was allowed.
+            chunk_mins=args.chunk_size,
             passes=args.repair_passes,
             strict=args.strict,
         )
