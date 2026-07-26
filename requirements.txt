@@ -1,0 +1,83 @@
+# This is a RECORD of a known-good environment, not a curated minimum and not
+# a version upgrade decision. Before this file existed, setup.sh installed
+# openai-whisper and mlx-whisper unpinned, so there was no way back if a pip
+# resolution changed underneath the project. These are the exact versions
+# confirmed (via a read-only `pip freeze` against the working .venv) to
+# install and run correctly together, and nothing here should move without
+# deliberately re-verifying the new versions against a real transcribe/repair
+# run.
+#
+# Only the two packages setup.sh installs directly are pinned. Their
+# transitive dependencies (torch, numpy, numba, mlx, mlx-metal, and the rest)
+# are left to the resolver: setup.sh supports Python 3.9-3.13 across macOS,
+# Linux, and both Apple Silicon and Intel, and a transitive closure pinned
+# from a `pip freeze` on one interpreter/platform can be unsatisfiable on
+# another (e.g. numba wheels lag new CPython releases by months - see
+# setup.sh's MAX_TESTED_PY_MINOR comment). Pinning only the direct
+# dependencies avoids shipping a requirements file that fails to install
+# somewhere this repo is supposed to work.
+#
+# For reference, this is the full `pip freeze` of the venv these two lines
+# were captured from (Python 3.9.6, macOS arm64/Apple Silicon):
+#
+#   annotated-doc==0.0.4
+#   anyio==4.12.1
+#   certifi==2026.7.22
+#   charset-normalizer==3.4.9
+#   click==8.1.8
+#   exceptiongroup==1.3.1
+#   filelock==3.19.1
+#   fsspec==2025.10.0
+#   h11==0.16.0
+#   hf-xet==1.5.2
+#   httpcore==1.0.9
+#   httpx==0.28.1
+#   huggingface_hub==1.8.0
+#   idna==3.18
+#   Jinja2==3.1.6
+#   llvmlite==0.43.0
+#   markdown-it-py==3.0.0
+#   MarkupSafe==3.0.3
+#   mdurl==0.1.2
+#   mlx==0.29.3
+#   mlx-metal==0.29.3
+#   mlx-whisper==0.4.3
+#   more-itertools==10.8.0
+#   mpmath==1.3.0
+#   networkx==3.2.1
+#   numba==0.60.0
+#   numpy==2.0.2
+#   openai-whisper==20250625
+#   packaging==26.2
+#   Pygments==2.20.0
+#   PyYAML==6.0.3
+#   regex==2026.1.15
+#   requests==2.32.5
+#   rich==15.0.0
+#   scipy==1.13.1
+#   shellingham==1.5.4
+#   sympy==1.14.0
+#   tiktoken==0.13.0
+#   torch==2.8.0
+#   tqdm==4.69.1
+#   typer==0.23.2
+#   typing_extensions==4.16.0
+#   urllib3==2.6.3
+#
+# To refresh this file after deliberately upgrading (never as a drive-by):
+#   1. .venv/bin/pip install --upgrade openai-whisper mlx-whisper  (or pin a
+#      specific new version)
+#   2. Run a real transcribe + repair cycle against a recording and confirm
+#      the output is still good - a pip resolution succeeding is not the same
+#      as Whisper still working.
+#   3. .venv/bin/pip freeze > /tmp/freeze.txt and update the two pins below
+#      and the reference block above from that output.
+#
+# mlx-whisper (and everything it pulls in, including mlx and mlx-metal) is
+# Apple-Silicon-only - mlx is Metal-only and cannot build or load elsewhere.
+# The environment marker below is what lets setup.sh run one `pip install -r
+# requirements.txt` on every supported platform: pip evaluates the marker and
+# silently skips this line anywhere it doesn't match, rather than failing.
+
+openai-whisper==20250625
+mlx-whisper==0.4.3 ; platform_machine == "arm64" and sys_platform == "darwin"

@@ -7,3 +7,14 @@ local/*
 # Everything the tools write — transcripts, repairs, backups, test fixtures.
 output/*
 !output/.gitkeep
+
+# Defence in depth: the patterns above cover the two directories the tools
+# write to, but a transcript that lands anywhere else is real speech from a
+# real meeting and must not be committable either. These match by what a file
+# *is*, wherever it was written.
+*.timestamped.txt
+*.srt
+*.readable.md
+*.summary.md
+*.repaired.*
+*.bak
