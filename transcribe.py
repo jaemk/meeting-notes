@@ -3,22 +3,24 @@
 Transcribe audio files using Whisper.
 
 Backends:
-  mlx    - Apple Silicon GPU (fast, recommended on M-series Macs)
+  mlx    - Apple Silicon GPU (fast; M-series Macs only)
   openai - CPU-based (slower, works everywhere)
+  auto   - mlx when this machine can run it, openai otherwise (default)
 
 Models (smallest/fastest → largest/most accurate):
   tiny, base, small, medium, large, large-v2, large-v3
 
 Long files are automatically split at silence boundaries to prevent
-Whisper's hallucination/repetition bug on extended audio.
-
-When a bad patch slips through anyway (a repeated line looping for 20+
-seconds), re-run just that stretch with --window and splice it back into
-an existing transcript with --merge.
+Whisper's hallucination/repetition bug on extended audio. Whatever slips
+through anyway is found and re-transcribed by the repair pass that runs
+automatically at the end (--no-repair to skip it); see repair.py to run
+that diagnose/repair/verify cycle against an existing transcript.
 """
 
 import argparse
+import importlib.util
 import json
+import platform
 import re
 import signal
 import subprocess
@@ -39,6 +41,42 @@ MLX_MODEL_MAP = {
     "large-v2": "mlx-community/whisper-large-v2-mlx-4bit",
     "large-v3": "mlx-community/whisper-large-v3-mlx-4bit",
 }
+
+BACKENDS = ["auto", "mlx", "openai"]
+
+
+# ── Backend selection ──────────────────────────────────────────────────────────
+
+def is_apple_silicon():
+    """mlx only exists for Apple's own GPUs — Darwin on arm64."""
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+
+def mlx_installed():
+    return importlib.util.find_spec("mlx_whisper") is not None
+
+
+def resolve_backend(requested):
+    """
+    Turn 'auto' into a concrete backend, and reject 'mlx' where it cannot run.
+    setup.sh only installs mlx-whisper on Apple Silicon, so everywhere else
+    this quietly settles on openai instead of failing per-chunk at decode time.
+    """
+    if requested == "openai":
+        return "openai"
+    if requested == "mlx":
+        if not is_apple_silicon():
+            raise SystemExit(
+                f"Error: --backend mlx needs Apple Silicon, this is "
+                f"{platform.system()}/{platform.machine()}. Use --backend openai."
+            )
+        if not mlx_installed():
+            raise SystemExit(
+                "Error: --backend mlx requested but mlx-whisper is not installed. "
+                "Run ./setup.sh"
+            )
+        return "mlx"
+    return "mlx" if (is_apple_silicon() and mlx_installed()) else "openai"
 
 
 # ── Audio helpers ──────────────────────────────────────────────────────────────
@@ -150,7 +188,12 @@ def _transcribe_one_openai(audio_path, model_name, language, _openai_model_cache
 
 
 def _run_backend(audio_path, backend, model_name, language, cache, condition_on_prev=True):
-    """Transcribe one prepared WAV, falling back from mlx to openai on failure."""
+    """
+    Transcribe one prepared WAV. `backend` should already be through
+    resolve_backend(); the fallback here only covers an mlx runtime failure
+    (out of memory, a model repo that won't fetch) on a machine that does
+    otherwise support it.
+    """
     if backend == "mlx":
         try:
             return _transcribe_one_mlx(audio_path, model_name, language, condition_on_prev)
@@ -356,56 +399,12 @@ def rebuild_text(segments):
     return " ".join(s["text"].strip() for s in segments if s["text"].strip())
 
 
-def run_windows(audio_path, windows, args, output_path):
-    """Re-transcribe each window, optionally splicing into an existing transcript."""
-    base = load_timestamped(args.merge) if args.merge else []
-    if base:
-        print(f"Loaded {len(base)} segments from {args.merge}\n")
-
-    result_segments = list(base)
-    for n, window in enumerate(windows, 1):
-        target = snap_window(result_segments, window) if (base and args.snap) else window
-        label = f"{fmt_time(window[0])}–{fmt_time(window[1])}"
-        if target != window:
-            label += f"  (snapped to {fmt_time(target[0])}–{fmt_time(target[1])})"
-        print(f"[window {n}/{len(windows)}] {label}")
-
-        if args.dry_run:
-            doomed = [s for s in result_segments
-                      if s["end"] > target[0] and s["start"] < target[1]]
-            print(f"  would replace {len(doomed)} existing segments:")
-            for s in doomed[:6]:
-                print(f"      [{fmt_time(s['start'])}] {s['text'][:60]}")
-            if len(doomed) > 6:
-                print(f"      … and {len(doomed) - 6} more")
-            print()
-            continue
-
-        new = transcribe_window(audio_path, target, args.backend, args.model,
-                                args.language, args.pad, args.condition_on_previous)
-        print(f"  → {len(new)} segments, {len(rebuild_text(new).split())} words")
-        for s in new:
-            print(f"      [{fmt_time(s['start'])}] {s['text']}")
-
-        if base:
-            result_segments, removed = splice(result_segments, target, new)
-            print(f"  replaced {len(removed)} segments with {len(new)}\n")
-        else:
-            result_segments.extend(new)
-            print()
-
-    if args.dry_run:
-        print("Dry run — nothing transcribed, nothing written.")
-        return
-
-    if args.merge and args.in_place:
-        backup = Path(args.merge).with_suffix(Path(args.merge).suffix + ".bak")
-        backup.write_text(Path(args.merge).read_text())
-        print(f"Backed up original: {backup}")
-
-    result_segments.sort(key=lambda s: (s["start"], s["end"]))
-    save_output({"text": rebuild_text(result_segments), "segments": result_segments},
-                output_path, True)
+def backup_file(path):
+    """Copy path to path + '.bak' before it is overwritten in place."""
+    src = Path(path)
+    dest = src.with_suffix(src.suffix + ".bak")
+    dest.write_text(src.read_text())
+    return dest
 
 
 # ── Output ─────────────────────────────────────────────────────────────────────
@@ -471,21 +470,9 @@ examples:
   %(prog)s beach.mp3 --output my_transcript --timestamps
   %(prog)s beach.mp3 --language en
 
-repairing a bad stretch (Whisper repetition loop) in an existing transcript:
-  # see what would be replaced, without transcribing anything
-  %(prog)s beach.m4a --merge transcript.timestamped.txt \\
-      --window 1:49:54-1:50:21 --dry-run
-
-  # re-transcribe three windows and splice them in, writing transcript.fixed.*
-  %(prog)s beach.m4a --merge transcript.timestamped.txt \\
-      --window 20:47-21:09 --window 1:39:45-1:39:48 --window 1:49:54-1:50:21
-
-  # overwrite the transcript in place (a .bak is written first)
-  %(prog)s beach.m4a --merge transcript.timestamped.txt \\
-      --window 1:49:54-1:50:21 --in-place
-
-  # just transcribe a window on its own, no merge
-  %(prog)s beach.m4a --window 1:49:54-1:50:21 -o dinghy_window
+Every run ends with a diagnose → repair → verify pass that re-transcribes
+hallucinated loops and dropped-speech gaps. Pass --no-repair to skip it, or
+use repair.py to run that cycle against a transcript you already have.
         """,
     )
     parser.add_argument("audio", help="Audio file to transcribe")
@@ -497,9 +484,9 @@ repairing a bad stretch (Whisper repetition loop) in an existing transcript:
     )
     parser.add_argument(
         "--backend", "-b",
-        default="mlx",
-        choices=["mlx", "openai"],
-        help="Backend (default: mlx for Apple Silicon GPU)",
+        default="auto",
+        choices=BACKENDS,
+        help="Backend (default: auto — mlx on Apple Silicon, else openai)",
     )
     parser.add_argument(
         "--chunk-size", "-c",
@@ -525,87 +512,75 @@ repairing a bad stretch (Whisper repetition loop) in an existing transcript:
         help="Also save timestamped .txt and .srt files (default: on)",
     )
 
-    win = parser.add_argument_group("window repair")
-    win.add_argument(
-        "--window", "-w",
-        type=parse_window,
-        action="append",
-        metavar="START-END",
-        help="Re-transcribe only this stretch, e.g. 1:49:54-1:50:21 or 6594-6621. "
-             "Repeatable.",
-    )
-    win.add_argument(
-        "--merge",
-        metavar="TIMESTAMPED_TXT",
-        help="Existing .timestamped.txt to splice the window(s) into. "
-             "Segments overlapping a window are replaced.",
-    )
-    win.add_argument(
-        "--in-place",
-        action="store_true",
-        help="With --merge, overwrite the source transcript (saves a .bak first)",
-    )
-    win.add_argument(
-        "--pad",
-        type=float,
-        default=15.0,
-        metavar="SECONDS",
-        help="Extra audio decoded either side of a window for context, then "
-             "discarded (default: 15)",
-    )
-    win.add_argument(
-        "--no-snap",
-        dest="snap",
+    rep = parser.add_argument_group("automatic repair (runs after transcription)")
+    rep.add_argument(
+        "--no-repair",
+        dest="repair",
         action="store_false",
-        help="Don't widen windows to whole segment boundaries when merging "
-             "(risks truncating a segment that straddles the edge)",
+        help="Skip the diagnose/repair/verify pass and keep the raw transcript",
     )
-    win.add_argument(
-        "--condition-on-previous",
-        action="store_true",
-        help="Let Whisper condition on prior text inside a window. Off by "
-             "default — conditioning is what causes repetition loops.",
+    rep.add_argument(
+        "--repair-model",
+        default=None,
+        choices=MODELS,
+        help="Model used to re-transcribe defective windows (default: same as --model)",
     )
-    win.add_argument(
-        "--dry-run",
+    rep.add_argument(
+        "--repair-passes",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Diagnose/repair rounds before the final check (default: 2)",
+    )
+    rep.add_argument(
+        "--strict",
         action="store_true",
-        help="With --window, print what would be replaced and exit",
+        help="Only splice a repaired window back in if it comes back completely clean",
     )
 
     args = parser.parse_args()
-
-    if args.merge and not args.window:
-        parser.error("--merge requires at least one --window")
-    if args.in_place and not args.merge:
-        parser.error("--in-place requires --merge")
 
     audio_path = Path(args.audio)
     if not audio_path.exists():
         print(f"Error: file not found: {audio_path}", file=sys.stderr)
         sys.exit(1)
 
-    if args.output:
-        output_path = output_stem(args.output)
-    elif args.merge:
-        merge_stem = output_stem(args.merge)
-        output_path = merge_stem if args.in_place else Path(str(merge_stem) + ".fixed")
-    else:
-        output_path = audio_path.parent / (audio_path.stem + "_transcript")
+    backend = resolve_backend(args.backend)
+    output_path = (output_stem(args.output) if args.output
+                   else audio_path.parent / (audio_path.stem + "_transcript"))
 
     print(f"Audio:    {audio_path}")
-    print(f"Model:    {args.model}  backend={args.backend}", end="")
-    print(f"  chunk={args.chunk_size}min" if not args.window else f"  pad={args.pad:.0f}s")
-    if args.merge:
-        print(f"Merge:    {args.merge}{'  (in place)' if args.in_place else ''}")
+    print(f"Model:    {args.model}  backend={backend}", end="")
+    print(f"  ({args.backend})" if backend != args.backend else "", end="")
+    print(f"  chunk={args.chunk_size}min")
     print(f"Output:   {output_path}.txt")
+    print(f"Repair:   {'on' if args.repair else 'off'}")
     print()
 
     t0 = time.time()
-    if args.window:
-        run_windows(audio_path, sorted(args.window), args, output_path)
-    else:
-        result = transcribe(audio_path, args.backend, args.model, args.language, args.chunk_size)
-        save_output(result, output_path, args.timestamps)
+    result = transcribe(audio_path, backend, args.model, args.language, args.chunk_size)
+    save_output(result, output_path, args.timestamps)
+
+    if args.repair:
+        import repair  # deferred: repair imports this module
+
+        opts = repair.RepairOptions(
+            backend=backend,
+            model=args.repair_model or args.model,
+            language=args.language,
+            passes=args.repair_passes,
+            strict=args.strict,
+        )
+        segments, report, _ = repair.diagnose_repair_verify(
+            audio_path, result["segments"], opts, title="Automatic repair pass"
+        )
+        # Only rewrite the files if a window was actually spliced — a clean
+        # transcript should not have its output touched a second time.
+        if any(spliced for _, _, spliced, _, _ in report):
+            segments.sort(key=lambda s: (s["start"], s["end"]))
+            save_output({"text": rebuild_text(segments), "segments": segments},
+                        output_path, args.timestamps)
+
     print(f"\nDone in {(time.time()-t0)/60:.1f} min")
 
 
