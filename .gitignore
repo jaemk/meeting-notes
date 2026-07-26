@@ -1,4 +1,9 @@
 .venv/
-local/
+
+# Source audio lives here and is never committed.
+local/*
 !local/.gitkeep
-!out/.gitkeep
+
+# Everything the tools write — transcripts, repairs, backups, test fixtures.
+output/*
+!output/.gitkeep

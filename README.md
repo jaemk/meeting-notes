@@ -18,17 +18,33 @@ rather than a silent fallback.
 
 `./setup.sh --force` rebuilds the venv from scratch.
 
+## Where files live
+
+    local/      recordings go here          (gitignored)
+    output/     everything written lands here (gitignored)
+
+Both directories are ignored, so no recording and no transcript ever reaches the
+repo. A bare filename on the command line is looked up in the directory that
+kind of file belongs to, so `transcribe.py 2026-07-25.m4a` finds
+`local/2026-07-25.m4a` and `repair.py verify 2026-07-25.timestamped.txt` finds
+it in `output/`. Anything with a directory component is used as given.
+
+**The transcript keeps the recording's name.** `local/2026-07-25.m4a` writes
+`output/2026-07-25.txt`, `output/2026-07-25.timestamped.txt` and
+`output/2026-07-25.srt`; a repair pass adds `output/2026-07-25.repaired.*`.
+Pass `--output` to override the stem.
+
 ## Transcribing
 
-    make transcribe INPUT=recording.m4a
+    make transcribe INPUT=local/2026-07-25.m4a
 
-or directly:
+With no `INPUT`, make picks up `local/input.*`.
 
-    .venv/bin/python transcribe.py recording.m4a
-    .venv/bin/python transcribe.py recording.m4a --model large-v3 --language en
-    .venv/bin/python transcribe.py recording.m4a --backend openai --model small
+Or directly:
 
-Writes `<output>.txt`, `<output>.timestamped.txt` and `<output>.srt`.
+    .venv/bin/python transcribe.py 2026-07-25.m4a
+    .venv/bin/python transcribe.py 2026-07-25.m4a --model large-v3 --language en
+    .venv/bin/python transcribe.py 2026-07-25.m4a --backend openai --model small
 
 Every run finishes with an automatic **diagnose → repair → verify** pass:
 
@@ -62,21 +78,24 @@ timestamps, which is why the check runs on its own.
 `repair.py` runs the same cycle against an existing transcript.
 
     # report only, exits nonzero if anything is wrong
-    .venv/bin/python repair.py diagnose recording.m4a transcript.timestamped.txt
+    .venv/bin/python repair.py diagnose 2026-07-25.m4a 2026-07-25.timestamped.txt
 
-    # find and fix everything -> transcript.repaired.{txt,timestamped.txt,srt}
-    .venv/bin/python repair.py repair recording.m4a transcript.timestamped.txt
+    # find and fix everything -> output/2026-07-25.repaired.{txt,timestamped.txt,srt}
+    .venv/bin/python repair.py repair 2026-07-25.m4a 2026-07-25.timestamped.txt
 
     # re-check a transcript; exit status is the pass/fail gate
-    .venv/bin/python repair.py verify transcript.repaired.timestamped.txt
+    .venv/bin/python repair.py verify 2026-07-25.repaired.timestamped.txt
 
-Or via make:
+Or via make, where `INPUT` picks the transcript for you:
 
-    make check                       # verify $(TRANSCRIPT)
-    make fix INPUT=recording.m4a     # repair everything it finds
-    make fix DRY=1                   # preview, decode nothing
-    make fix IN_PLACE=1              # overwrite the transcript, keeps a .bak
+    make check INPUT=local/2026-07-25.m4a   # verify output/2026-07-25.timestamped.txt
+    make fix   INPUT=local/2026-07-25.m4a   # repair everything it finds
+    make fix DRY=1                          # preview, decode nothing
+    make fix IN_PLACE=1                     # overwrite the transcript, keeps a .bak
     make fix WINDOWS="-w 20:47-21:09 -w 1:49:54-1:50:21"
+
+`TRANSCRIPT=<file>` overrides that choice, and `make clean` removes just this
+recording's outputs, leaving the rest of `output/` alone.
 
 With `-w` only those stretches are re-decoded and detection is skipped for
 window selection; without it the windows come from the diagnosis. Either way
@@ -99,7 +118,12 @@ Notes:
 
     make test
 
-`test_transcribe.py` and `test_repair.py` share the harness and fixture paths in
-`testlib.py`. Everything decode-related is stubbed, so the suite runs in
-seconds; the few checks that need the real audio in `local/` skip if it is
-absent.
+`test_transcribe.py` and `test_repair.py` share the harness in `testlib.py`,
+which also builds both fixtures into `output/`: a synthetic transcript with a
+known loop, rewind and gap planted in neutral filler, and thirty seconds of
+ffmpeg-generated tone/silence for the gap classifier. Nothing depends on a
+recording, so a fresh clone runs the whole suite — and every number the tests
+assert is a property of the generator rather than of somebody's meeting.
+
+Decoding is stubbed throughout, so it finishes in seconds. The only thing that
+can skip is the audio-backed gap classification, if `ffmpeg` is not installed.

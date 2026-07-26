@@ -2,7 +2,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from testlib import Checks, SAVED_TRANSCRIPT
+from testlib import Checks, FIXTURE
 import transcribe as T
 
 check = Checks()
@@ -30,6 +30,32 @@ finally:
 check("window repair CLI no longer lives here (repair.py owns it)",
       not hasattr(T, "run_windows"))
 
+check.section("input comes from local/, output goes to output/")
+check("audio is read from local/", T.INPUT_DIR == T.ROOT / "local", T.INPUT_DIR)
+check("transcripts are written to output/", T.OUTPUT_DIR == T.ROOT / "output", T.OUTPUT_DIR)
+check("the recording's name carries over to its transcript",
+      T.default_output("local/2026-07-25.m4a") == T.OUTPUT_DIR / "2026-07-25",
+      T.default_output("local/2026-07-25.m4a"))
+check("dots in a recording name are not treated as an extension",
+      T.default_output(Path("local/team.sync.2026-07-25.m4a")) ==
+      T.OUTPUT_DIR / "team.sync.2026-07-25")
+check("a bare stem lands in output/", T.resolve_output("beach") == T.OUTPUT_DIR / "beach")
+check("an explicit directory is left alone",
+      T.resolve_output("elsewhere/beach") == Path("elsewhere/beach"))
+check("resolve_output strips a transcript extension",
+      T.resolve_output("beach.timestamped.txt") == T.OUTPUT_DIR / "beach")
+check("a bare transcript name is found in output/",
+      T.resolve_transcript(FIXTURE.path.name) == FIXTURE.path,
+      T.resolve_transcript(FIXTURE.path.name))
+with tempfile.TemporaryDirectory() as d:
+    (Path(d) / "clip.m4a").write_text("x")
+    check("a bare filename is looked up in the directory it belongs in",
+          T._resolve_in("clip.m4a", Path(d)) == Path(d) / "clip.m4a")
+    check("an unknown name comes back as asked, so the error can name it",
+          T._resolve_in("nope.m4a", Path(d)) == Path("nope.m4a"))
+    check("a path with a directory in it is never redirected",
+          T._resolve_in("sub/clip.m4a", Path(d)) == Path("sub/clip.m4a"))
+
 check.section("parse_time / parse_window")
 check("HH:MM:SS", T.parse_time("1:49:54") == 6594.0)
 check("MM:SS", T.parse_time("20:47") == 1247.0)
@@ -40,57 +66,63 @@ check("window dotdot", T.parse_window("20:47..21:09") == (1247.0, 1269.0))
 check.raises("reversed rejected", T.parse_window, "21:09-20:47")
 check.raises("garbage rejected", T.parse_window, "garbage")
 
-check.section("load_timestamped round trip on the real file")
-segs = T.load_timestamped(SAVED_TRANSCRIPT)
-check("2963 segments", len(segs) == 2963, len(segs))
-check("first seg", segs[0]["text"].startswith("Guys, this is my last one"))
-check("dinghy loop present", segs[2302]["text"] == "It's a dinghy.")
+check.section("load_timestamped round trip on the fixture")
+segs = T.load_timestamped(FIXTURE.path)
+check("239 segments", len(segs) == 239, len(segs))
+check("parses back to exactly what was written", segs == FIXTURE.segments)
+check("first seg", segs[0]["text"].startswith("Okay, so where did we leave off"))
+big = FIXTURE.big_loop
+check("planted loop is where it says it is", segs[big.index]["text"] == big.text)
 
-check.section("find_repeats on the real file")
+check.section("find_repeats on the fixture")
 runs = T.find_repeats(segs)
 found = {(c, t) for _, c, t in runs}
-check("finds 27x dinghy", (27, "It's a dinghy.") in found)
-check("finds 22x idk", (22, "I don't know.") in found)
-check("finds 4x sure", (4, "Sure.") in found)
+check("finds the 27-line loop", (27, "Yeah, absolutely.") in found, found)
+check("finds the 22-line loop", (22, "I'm not sure about that.") in found, found)
+check("finds the 4-line loop", (4, "Right.") in found, found)
 check("only 3 runs", len(runs) == 3, [(c, t) for _, c, t in runs])
 
 check.section("snap_window")
-snapped = T.snap_window(segs, (6590.0, 6625.0))
-check("snaps back to 6579.21", abs(snapped[0] - 6579.21) < 0.01, snapped)
-check("snaps fwd to 6627.21", abs(snapped[1] - 6627.21) < 0.01, snapped)
-exact = T.snap_window(segs, (6594.21, 6621.21))
-check("exact window unchanged", exact == (6594.21, 6621.21), exact)
-check("no-touch window unchanged", T.snap_window(segs, (999999, 999999 + 5)) == (999999, 999999 + 5))
+inside = T.snap_window(segs, (big.start + 4.5, big.end - 3.5))
+check("widens to whole segments", inside == (big.start + 4.0, big.end - 3.0), inside)
+check("exact window unchanged", T.snap_window(segs, (big.start, big.end)) == (big.start, big.end))
+over = T.snap_window(segs, (big.start - 1.0, big.end + 1.0))
+check("pulls in a neighbour it only clips", over == (big.start - 3.0, big.end + 3.0), over)
+check("no-touch window unchanged",
+      T.snap_window(segs, (999999, 999999 + 5)) == (999999, 999999 + 5))
 
 check.section("splice")
-merged, removed = T.splice(segs, (6594.21, 6621.21), [
-    {"start": 6594.21, "end": 6600.0, "text": "NEW A"},
-    {"start": 6600.0, "end": 6621.21, "text": "NEW B"},
+merged, removed = T.splice(segs, (big.start, big.end), [
+    {"start": big.start, "end": big.start + 12.0, "text": "NEW A"},
+    {"start": big.start + 12.0, "end": big.end, "text": "NEW B"},
 ])
-check("removed 27 loop segs", len(removed) == 27, len(removed))
-check("all removed were the loop", all(r["text"] == "It's a dinghy." for r in removed))
-check("net count", len(merged) == 2963 - 27 + 2, len(merged))
-check("neighbour before kept", any(s["text"] == "a dinghy." for s in merged))
-check("neighbour after kept", any(s["text"].startswith("Well, and that's the problem") for s in merged))
-check("no loop left", not any(s["text"] == "It's a dinghy." for s in merged))
+check("removed all 27 loop segs", len(removed) == 27, len(removed))
+check("all removed were the loop", all(r["text"] == big.text for r in removed))
+check("net count", len(merged) == 239 - 27 + 2, len(merged))
+check("neighbour before kept", any(s["text"] == FIXTURE.before_big for s in merged))
+check("neighbour after kept", any(s["text"] == FIXTURE.after_big for s in merged))
+check("no loop left", not any(s["text"] == big.text for s in merged))
 check("new text in", [s["text"] for s in merged if s["text"].startswith("NEW")] == ["NEW A", "NEW B"])
-# splice deliberately does NOT globally sort: the source file contains a
+# splice deliberately does NOT globally sort: a transcript can contain a
 # rewound block whose timestamps go backwards, and re-sorting would interleave
 # it line-by-line into its neighbour. Only the new material is ordered.
 check("replacement inserted in order",
       [s["text"] for s in merged if s["text"].startswith("NEW")] == ["NEW A", "NEW B"])
 check("pre-existing out-of-order block left as it was",
-      [s["text"] for s in merged] == [s["text"] for s in segs[:2302]]
-      + ["NEW A", "NEW B"] + [s["text"] for s in segs[2329:]])
+      [s["text"] for s in merged] == [s["text"] for s in segs[:big.index]]
+      + ["NEW A", "NEW B"] + [s["text"] for s in segs[big.index + 27:]])
 
-check.section("splice of the rewinding idk loop (overlapping real audio)")
-snap_idk = T.snap_window(segs, (1246.86, 1268.86))
-m2, rem2 = T.splice(segs, snap_idk, [{"start": snap_idk[0], "end": snap_idk[1], "text": "REAL"}])
-check("idk loop removed",
-      not any(s["text"] == "I don't know." and 1246 < s["start"] < 1269 for s in m2))
-check("duplicated real lines also removed",
-      not any(s["text"].startswith("be okay and that might be") for s in m2))
-print(f"    (snapped {snap_idk[0]:.2f}-{snap_idk[1]:.2f}, removed {len(rem2)} segs — "
+check.section("splice of the rewinding loop (overlaps real speech)")
+rw = FIXTURE.rewind_loop
+snap_rw = T.snap_window(segs, (rw.start, rw.end))
+m2, rem2 = T.splice(segs, snap_rw, [{"start": snap_rw[0], "end": snap_rw[1], "text": "REAL"}])
+check("loop removed", not any(s["text"] == rw.text for s in m2))
+check("the real lines it buried are removed with it",
+      not any(s["text"] in FIXTURE.duplicated for s in m2))
+check("removed the loop plus the 4 lines it re-covered", len(rem2) == rw.count + 4, len(rem2))
+check("speech outside the rewind survives",
+      any(s["text"] == FIXTURE.after_big for s in m2))
+print(f"    (snapped {snap_rw[0]:.2f}-{snap_rw[1]:.2f}, removed {len(rem2)} segs — "
       f"loop + real lines re-covering the same clock time)")
 
 check.section("transcribe_window padding / midpoint trimming (stubbed backend)")
@@ -138,12 +170,16 @@ check("overlapping segments counted once",
 
 check.section("save_output dotted stem / backup_file")
 with tempfile.TemporaryDirectory() as d:
-    stem = Path(d) / "saved-transcript.fixed"
+    stem = Path(d) / "2026-07-25.repaired"
     T.save_output({"text": "hi", "segments": [{"start": 0, "end": 1, "text": "hi"}]}, stem, True)
     names = sorted(os.listdir(d))
     check("writes 3 dotted files",
-          names == ["saved-transcript.fixed.srt", "saved-transcript.fixed.timestamped.txt",
-                    "saved-transcript.fixed.txt"], names)
+          names == ["2026-07-25.repaired.srt", "2026-07-25.repaired.timestamped.txt",
+                    "2026-07-25.repaired.txt"], names)
+    nested = Path(d) / "does" / "not" / "exist" / "beach"
+    T.save_output({"text": "hi", "segments": []}, nested, True)
+    check("creates the output directory if it is missing",
+          (Path(str(nested) + ".txt")).exists())
     src = Path(d) / "t.timestamped.txt"
     src.write_text("original")
     bak = T.backup_file(src)

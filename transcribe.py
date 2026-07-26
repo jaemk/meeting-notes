@@ -10,6 +10,10 @@ Backends:
 Models (smallest/fastest → largest/most accurate):
   tiny, base, small, medium, large, large-v2, large-v3
 
+Audio is read from local/ and transcripts are written to output/ (both
+gitignored). A recording's name carries over to its transcript, so
+local/2026-07-25.m4a becomes output/2026-07-25.txt and friends.
+
 Long files are automatically split at silence boundaries to prevent
 Whisper's hallucination/repetition bug on extended audio. Whatever slips
 through anyway is found and re-transcribed by the repair pass that runs
@@ -29,6 +33,12 @@ import tempfile
 import time
 from pathlib import Path
 
+
+ROOT = Path(__file__).resolve().parent
+# Source audio lives in local/, everything written lands in output/. Both are
+# gitignored, so nothing anyone actually says ends up in the repo.
+INPUT_DIR = ROOT / "local"
+OUTPUT_DIR = ROOT / "output"
 
 MODELS = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
 
@@ -77,6 +87,45 @@ def resolve_backend(requested):
             )
         return "mlx"
     return "mlx" if (is_apple_silicon() and mlx_installed()) else "openai"
+
+
+# ── Where files live ───────────────────────────────────────────────────────────
+
+def _resolve_in(path, directory):
+    """
+    Look a bare filename up in the directory this repo keeps that kind of file
+    in, so `transcribe.py beach.m4a` finds local/beach.m4a. Anything with a
+    directory component, or that already exists, is returned untouched.
+    """
+    p = Path(path)
+    if p.exists() or p.is_absolute() or len(p.parts) > 1:
+        return p
+    candidate = directory / p.name
+    return candidate if candidate.exists() else p
+
+
+def resolve_input(path):
+    """Audio is read from local/."""
+    return _resolve_in(path, INPUT_DIR)
+
+
+def resolve_transcript(path):
+    """Transcripts were written to output/, so that is where they are read from."""
+    return _resolve_in(path, OUTPUT_DIR)
+
+
+def resolve_output(stem):
+    """
+    Transcripts are written to output/ unless a directory was named explicitly.
+    Returns a stem — save_output appends .txt / .timestamped.txt / .srt.
+    """
+    p = output_stem(stem)
+    return p if len(p.parts) > 1 or p.is_absolute() else OUTPUT_DIR / p.name
+
+
+def default_output(audio_path):
+    """output/<audio name> — the recording's own name carries over to its transcript."""
+    return OUTPUT_DIR / Path(audio_path).stem
 
 
 # ── Audio helpers ──────────────────────────────────────────────────────────────
@@ -430,8 +479,9 @@ def output_stem(path):
 
 def save_output(result, output_path, timestamps):
     # Append rather than with_suffix() — stems legitimately contain dots
-    # (e.g. "saved-transcript.fixed"), and with_suffix would eat them.
+    # (e.g. a recording named "2026-07-25"), and with_suffix would eat them.
     output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     txt_path = Path(str(output_path) + ".txt")
     with open(txt_path, "w") as f:
@@ -463,19 +513,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  %(prog)s beach.mp3
-  %(prog)s beach.mp3 --model large-v3 --timestamps
-  %(prog)s beach.mp3 --backend openai --model small
-  %(prog)s beach.mp3 --chunk-size 5
-  %(prog)s beach.mp3 --output my_transcript --timestamps
-  %(prog)s beach.mp3 --language en
+  %(prog)s 2026-07-25.m4a                     # local/2026-07-25.m4a -> output/2026-07-25.*
+  %(prog)s local/beach.m4a --model large-v3
+  %(prog)s beach.m4a --backend openai --model small
+  %(prog)s beach.m4a --chunk-size 5
+  %(prog)s beach.m4a --output my_transcript   # -> output/my_transcript.*
+  %(prog)s beach.m4a --language en
+
+Audio is read from local/ and transcripts are written to output/, both of
+which are gitignored. The transcript keeps the recording's name.
 
 Every run ends with a diagnose → repair → verify pass that re-transcribes
 hallucinated loops and dropped-speech gaps. Pass --no-repair to skip it, or
 use repair.py to run that cycle against a transcript you already have.
         """,
     )
-    parser.add_argument("audio", help="Audio file to transcribe")
+    parser.add_argument("audio", help="Audio file to transcribe (a bare name is looked up in local/)")
     parser.add_argument(
         "--model", "-m",
         default="medium",
@@ -498,7 +551,7 @@ use repair.py to run that cycle against a transcript you already have.
     parser.add_argument(
         "--output", "-o",
         default=None,
-        help="Output path without extension (default: <audio>_transcript)",
+        help="Output stem, without extension (default: output/<audio name>)",
     )
     parser.add_argument(
         "--language", "-l",
@@ -540,14 +593,15 @@ use repair.py to run that cycle against a transcript you already have.
 
     args = parser.parse_args()
 
-    audio_path = Path(args.audio)
+    audio_path = resolve_input(args.audio)
     if not audio_path.exists():
-        print(f"Error: file not found: {audio_path}", file=sys.stderr)
+        print(f"Error: file not found: {args.audio} (looked in {INPUT_DIR}/ too)",
+              file=sys.stderr)
         sys.exit(1)
 
     backend = resolve_backend(args.backend)
-    output_path = (output_stem(args.output) if args.output
-                   else audio_path.parent / (audio_path.stem + "_transcript"))
+    output_path = (resolve_output(args.output) if args.output
+                   else default_output(audio_path))
 
     print(f"Audio:    {audio_path}")
     print(f"Model:    {args.model}  backend={backend}", end="")

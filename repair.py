@@ -13,10 +13,13 @@ Both are invisible in the .txt output — you only see them by looking at the
 timestamps. This finds them, re-transcribes just the affected windows, splices
 the result back in, and then re-runs the check to report what is left.
 
-  ./repair.py diagnose beach.m4a transcript.timestamped.txt
-  ./repair.py repair   beach.m4a transcript.timestamped.txt
-  ./repair.py repair   beach.m4a transcript.timestamped.txt -w 20:47-21:09
-  ./repair.py verify   transcript.repaired.timestamped.txt
+  ./repair.py diagnose beach.m4a beach.timestamped.txt
+  ./repair.py repair   beach.m4a beach.timestamped.txt
+  ./repair.py repair   beach.m4a beach.timestamped.txt -w 20:47-21:09
+  ./repair.py verify   beach.repaired.timestamped.txt
+
+Audio is looked up in local/ and transcripts in output/, so the bare names
+above work from anywhere.
 
 transcribe.py runs this same cycle automatically at the end of a transcription;
 the commands above are for a transcript you already have, or for overriding
@@ -387,12 +390,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  %(prog)s diagnose beach.m4a transcript.timestamped.txt
-  %(prog)s repair   beach.m4a transcript.timestamped.txt --model large-v2 -l en
-  %(prog)s repair   beach.m4a transcript.timestamped.txt --in-place
-  %(prog)s repair   beach.m4a transcript.timestamped.txt -w 20:47-21:09 --dry-run
-  %(prog)s verify   transcript.repaired.timestamped.txt
+  %(prog)s diagnose beach.m4a beach.timestamped.txt
+  %(prog)s repair   beach.m4a beach.timestamped.txt --model large-v2 -l en
+  %(prog)s repair   beach.m4a beach.timestamped.txt --in-place
+  %(prog)s repair   beach.m4a beach.timestamped.txt -w 20:47-21:09 --dry-run
+  %(prog)s verify   beach.repaired.timestamped.txt
 
+Audio is looked up in local/ and transcripts in output/, so bare names work.
 With no -w the windows come from the diagnosis; with -w only those stretches
 are re-decoded. Either way it is the same splice-and-recheck path.
         """,
@@ -438,6 +442,11 @@ are re-decoded. Either way it is the same splice-and-recheck path.
     add_common(v)
 
     args = ap.parse_args()
+    # Audio comes from local/, transcripts from output/ — a bare name on the
+    # command line is looked up there rather than only in the cwd.
+    args.transcript = T.resolve_transcript(args.transcript)
+    if getattr(args, "audio", None):
+        args.audio = T.resolve_input(args.audio)
     segments = T.load_timestamped(args.transcript)
 
     if args.cmd in ("verify", "diagnose"):
@@ -468,7 +477,7 @@ are re-decoded. Either way it is the same splice-and-recheck path.
         print("\nDry run — nothing transcribed, nothing written.")
         sys.exit(0)
 
-    stem = (T.output_stem(args.output) if args.output
+    stem = (T.resolve_output(args.output) if args.output
             else T.output_stem(args.transcript) if args.in_place
             else Path(str(T.output_stem(args.transcript)) + ".repaired"))
     if args.in_place:
