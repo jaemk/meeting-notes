@@ -1,24 +1,31 @@
-from testlib import Checks, SAMPLE_AUDIO, SAVED_TRANSCRIPT
+from testlib import (Checks, FIXTURE, AUDIO_MIXED, AUDIO_SILENCE, AUDIO_TONE,
+                     build_audio_fixture)
 import transcribe as T
 import repair as R
 
 check = Checks()
 
-segs = T.load_timestamped(SAVED_TRANSCRIPT)
+segs = T.load_timestamped(FIXTURE.path)
+big, rw, short = FIXTURE.big_loop, FIXTURE.rewind_loop, FIXTURE.short_loop
 
-check.section("diagnose (no audio check) on the known-bad transcript")
+check.section("diagnose (no audio check) on the fixture")
 d = R.diagnose(segs, None, check_audio=False)
 loops = [x for x in d if x.kind == "loop"]
 gaps  = [x for x in d if x.kind == "gap"]
 rew   = [x for x in d if x.kind == "rewind"]
-check("finds 3 loops", len(loops) == 3, [x.detail for x in loops])
-check("loop windows match", [round(l.start, 2) for l in loops] == [1246.86, 5984.60, 6594.21],
-      [l.start for l in loops])
-check("finds 12 gaps", len(gaps) == 12, len(gaps))
+check("finds all 3 loops", len(loops) == 3, [x.detail for x in loops])
+check("loop windows match what was planted",
+      [(l.start, l.end) for l in loops] ==
+      [(short.start, short.end), (big.start, big.end), (rw.start, rw.end)],
+      [(l.start, l.end) for l in loops])
+check("finds 7 gaps", len(gaps) == 7, len(gaps))
 check("finds the 1 rewind", len(rew) == 1, len(rew))
+check("the rewind is the loop that restarts on the clock",
+      abs(rew[0].start - rw.start) < 0.01, rew[0].start)
 check("loops+gaps repairable", all(x.repairable for x in loops + gaps))
 check("rewind not repairable", not rew[0].repairable)
 check("sorted by time", all(d[i].start <= d[i + 1].start for i in range(len(d) - 1)))
+check("filler speech produces no defects of its own", len(d) == 11, [str(x) for x in d])
 
 check.section("stutter / canned detection")
 synth = [
@@ -35,14 +42,18 @@ check("finds 2 canned", sum(1 for x in ds if x.kind == "canned") == 2,
       [x.detail for x in ds if x.kind == "canned"])
 check("normal line untouched",
       not any(x.kind in ("stutter", "canned") and x.start == 6 for x in ds))
+check("the fixture's filler trips neither detector",
+      not any(x.kind in ("stutter", "canned") for x in d), [str(x) for x in d])
 
 check.section("merge_windows / defect_windows")
 check("coalesces adjacent", R.merge_windows([(0, 10), (12, 20), (100, 110)], 5) == [(0, 20), (100, 110)])
 check("leaves distant alone", R.merge_windows([(0, 10), (100, 110)], 5) == [(0, 10), (100, 110)])
 check("handles empty", R.merge_windows([]) == [])
 check("handles nested", R.merge_windows([(0, 50), (10, 20)], 5) == [(0, 50)])
-check("real defects collapse 15 -> 13 windows", len(R.defect_windows(d, 5)) == 13,
-      len(R.defect_windows(d, 5)))
+w = R.defect_windows(d, 5)
+check("10 repairable defects collapse to 9 windows",
+      (sum(1 for x in d if x.repairable), len(w)) == (10, 9), (len(d), len(w)))
+check("the two gaps 3s apart became one window", (474.0, 495.0) in w, w)
 check("defect_windows ignores non-repairable kinds",
       R.defect_windows([x for x in d if x.kind == "rewind"], 5) == [])
 
@@ -64,29 +75,28 @@ def stub_window(audio, window, backend, model, lang, pad, condition_on_prev=Fals
         return [{"start": a + i, "end": a + i + 1, "text": "loop"} for i in range(int(b - a))]
     return [{"start": a, "end": b, "text": "recovered speech"}]
 T.transcribe_window = stub_window
-one_loop = [x for x in d if x.kind == "loop"][2:3]
+one_loop = [x for x in d if x.kind == "loop" and x.start == big.start]
 windows = R.defect_windows(one_loop, opts.join_within)
-out, report = R.repair("beach.m4a", segs, windows, opts)
+out, report = R.repair("fixture.wav", segs, windows, opts)
 check("escalated past the looping attempt", len(attempts) == 2, len(attempts))
 check("conditioning off on every attempt", all(a["cond"] is False for a in attempts))
 check("second attempt widened pad", attempts[1]["pad"] == 30.0, attempts[1]["pad"])
-check("loop text gone", not any(s["text"] == "It's a dinghy." for s in out))
+check("loop text gone", not any(s["text"] == big.text for s in out))
 check("stub text spliced in", any(s["text"] == "recovered speech" for s in out))
-win = one_loop[0]
-in_window = [s for s in out if s["end"] > win.start and s["start"] < win.end]
+in_window = [s for s in out if s["end"] > big.start and s["start"] < big.end]
 check("no loop survives in the repaired window", not T.find_repeats(in_window), in_window)
 check("untouched loops elsewhere still present (only 1 defect was repaired)",
       len(T.find_repeats(out)) == 2, [c for _, c, _ in T.find_repeats(out)])
 check("report marks repaired", report[0][1] == "repaired", report)
 check("report marks it spliced", report[0][2] is True, report)
-check("neighbours preserved", any(s["text"].startswith("Well, and that's the problem") for s in out))
+check("neighbours preserved", any(s["text"] == FIXTURE.after_big for s in out))
 
 check.section("dry run decodes nothing and changes nothing")
 attempts.clear()
-out_dry, report_dry = R.repair("beach.m4a", segs, windows, opts, dry_run=True)
+out_dry, report_dry = R.repair("fixture.wav", segs, windows, opts, dry_run=True)
 check("no decode attempted", attempts == [], attempts)
 check("segments untouched", out_dry is segs)
-check("loop still there", any(s["text"] == "It's a dinghy." for s in out_dry))
+check("loop still there", any(s["text"] == big.text for s in out_dry))
 check("report marks dry-run, not spliced",
       (report_dry[0][1], report_dry[0][2]) == ("dry-run", False), report_dry)
 
@@ -98,11 +108,11 @@ def always_loops(audio, window, backend, model, lang, pad, condition_on_prev=Fal
     return [{"start": a + i, "end": a + i + 1, "text": "loop"} for i in range(int(b - a))]
 T.transcribe_window = always_loops
 strict = R.RepairOptions(backend="mlx", language="en", strict=True)
-out2, report2 = R.repair("beach.m4a", segs, windows, strict)
+out2, report2 = R.repair("fixture.wav", segs, windows, strict)
 check("exhausted all 3 attempts", len(attempts) == 3, len(attempts))
 check("strict skipped the splice", report2[0][1].startswith("skipped"), report2)
 check("strict report marks it not spliced", report2[0][2] is False, report2)
-check("original left untouched", any(s["text"] == "It's a dinghy." for s in out2))
+check("original left untouched", any(s["text"] == big.text for s in out2))
 check("segment count unchanged", len(out2) == len(segs))
 
 check.section("diagnose_repair_verify: repair, then re-check")
@@ -143,14 +153,23 @@ check("splice happened but stayed defective",
       any(x.kind == "loop" for x in remaining3), [str(x) for x in remaining3])
 check("verify does not silently report success", any(x.repairable for x in remaining3))
 
-check.section("gap classification is wired to real audio")
-if not SAMPLE_AUDIO.exists():
-    check.skip("audio-backed gap classification", f"{SAMPLE_AUDIO} not present")
+check.section("gap classification measures the audio underneath")
+audio = build_audio_fixture()
+if audio is None:
+    check.skip("audio-backed gap classification", "ffmpeg unavailable")
 else:
-    speech, why = R.gap_is_speech(SAMPLE_AUDIO, 5697.72, 5721.32)
-    check("known gap classified as speech", speech is True, why)
-    mean, peak, sil, dur = R.audio_level(SAMPLE_AUDIO, 0, 20)
+    speech, why = R.gap_is_speech(audio, *AUDIO_TONE)
+    check("a gap over sound is dropped speech", speech is True, why)
+    quiet, why = R.gap_is_speech(audio, *AUDIO_SILENCE)
+    check("a gap over silence is left alone", quiet is False, why)
+    mixed, why = R.gap_is_speech(audio, *AUDIO_MIXED)
+    check("half silence is still speech, not a pause", mixed is True, why)
+    mean, peak, sil, dur = R.audio_level(audio, *AUDIO_TONE)
     check("audio_level reads dB", mean is not None and -60 < mean < 0, mean)
-    check("audio_level reports duration", abs(dur - 20) < 0.1, dur)
+    check("audio_level reports the silence it found", sil == 0.0, sil)
+    check("audio_level reports duration", abs(dur - 10) < 0.1, dur)
+    mean_q, _, sil_q, _ = R.audio_level(audio, *AUDIO_SILENCE)
+    check("silence reads far quieter than tone", mean_q < mean - 30, (mean_q, mean))
+    check("and is reported as silent for its whole length", sil_q > 9.0, sil_q)
 
 check.finish()

@@ -2,10 +2,12 @@ VENV   := .venv
 PYTHON := $(VENV)/bin/python
 STAMP  := $(VENV)/.setup-complete
 
-# Input audio. Override with INPUT=<file> or an env var.
-INPUT  ?= $(firstword $(wildcard input.*) $(wildcard local/input.*))
-# OUTPUT is the stem — the script appends .txt / .srt / .timestamped.txt
-OUTPUT ?= transcript
+# Audio lives in local/, everything written lands in output/. Both are
+# gitignored, so no recording and no transcript ever reaches the repo.
+INPUT  ?= $(firstword $(wildcard local/input.*))
+# The transcript keeps the recording's name: local/2026-07-25.m4a writes
+# output/2026-07-25.txt, .timestamped.txt and .srt.
+OUTPUT ?= output/$(basename $(notdir $(INPUT)))
 # The transcript that check/fix operate on
 TRANSCRIPT ?= $(OUTPUT).timestamped.txt
 
@@ -19,7 +21,11 @@ FIX_ARGS ?= --model large-v2 -l en
 all: transcribe
 
 define need_input
-@test -n "$(INPUT)" || { echo "Error: no file matching 'input.*' found — pass INPUT=<file>"; exit 1; }
+@test -n "$(INPUT)" || { echo "Error: no local/input.* found — pass INPUT=local/<file>"; exit 1; }
+endef
+
+define need_transcript
+@test -f "$(TRANSCRIPT)" || { echo "Error: no transcript at '$(TRANSCRIPT)' — pass INPUT=local/<audio> or TRANSCRIPT=<file>"; exit 1; }
 endef
 
 # Transcribe, then automatically diagnose → repair → re-check.
@@ -31,6 +37,7 @@ transcribe: $(STAMP)
 
 # Report loops/gaps in an existing transcript. Exits nonzero if any remain.
 check: $(STAMP)
+	$(need_transcript)
 	$(PYTHON) repair.py verify $(TRANSCRIPT) $(if $(INPUT),--audio $(INPUT),)
 
 # Run the repair pass on its own, against an existing transcript.
@@ -40,6 +47,7 @@ check: $(STAMP)
 #   make fix IN_PLACE=1                       overwrite $(TRANSCRIPT), keeps a .bak
 fix: $(STAMP)
 	$(need_input)
+	$(need_transcript)
 	$(PYTHON) repair.py repair $(INPUT) $(TRANSCRIPT) $(FIX_ARGS) $(WINDOWS) \
 		$(if $(IN_PLACE),--in-place,) $(if $(DRY),--dry-run,)
 
@@ -54,9 +62,12 @@ $(STAMP): setup.sh
 setup:
 	./setup.sh
 
+# Only this recording's outputs — other transcripts in output/ are left alone.
 clean:
+	$(need_input)
 	rm -f $(OUTPUT).txt $(OUTPUT).timestamped.txt $(OUTPUT).srt \
 	      $(OUTPUT).repaired.* $(OUTPUT).*.bak
 
-distclean: clean
+distclean:
 	rm -rf $(VENV)
+	find output -type f ! -name .gitkeep -delete
