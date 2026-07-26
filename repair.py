@@ -31,7 +31,14 @@ the commands above are for a transcript you already have, or for overriding
 which windows get re-decoded.
 
 Gaps are classified by measuring the audio underneath them: a gap over silence
-is correct behaviour and is left alone, a gap over speech is lost content.
+is correct behaviour and is left alone, a gap over speech is lost content. Not
+every gap over sound is speech, though, and level alone cannot tell them apart
+— applause is as loud as a sentence. The dynamics can, so they gate which gaps
+a decode is allowed to go to: loud and flat is applause or room noise and is
+not a defect, quiet throughout is off-mic speech no decode has ever recovered,
+and what is left in the middle is the bucket --include-gaps targets. The
+thresholds are flags, because the recording they were measured on sits on top
+of them.
 
 A third failure needs no decoding at all. Whisper does not stop where its audio
 does, so a chunk ending mid-loop keeps emitting past its seam and that tail
@@ -41,6 +48,11 @@ the entire repair. It runs first, before any window is chosen — a hallucinated
 tail that is already gone needs no decode to remove it, and deleting it later
 would mean walking back across text a repair had just spliced in. Nothing is
 deleted until the recording confirms the seam is a real chunk boundary.
+
+The last chunk overruns the same way and has no successor to give it away: a
+backwards jump needs a next chunk to jump back from, and there isn't one. What
+it leaves instead is a transcript that outlasts its own recording, so that is
+what gets checked — the final segment's end against the file's duration.
 """
 
 import argparse
@@ -49,7 +61,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import transcribe as T
 
@@ -61,9 +73,81 @@ REPETITION_KINDS = ("loop", "stutter", "canned")
 # is wrong, and on a real recording they outnumber the repetitions several to
 # one, so repairing them by default turns a targeted fix into a broad re-run.
 REPAIRABLE_KINDS = REPETITION_KINDS + ("gap",)
+# The two buckets of gap a decode cannot recover, and so is not spent on. Both
+# are found by measuring, both are reported with the numbers that put them
+# there, and neither is in REPAIRABLE_KINDS — so --include-gaps widens the
+# repair to the gaps in between and not to these.
+AMBIENT = "ambient"     # loud and flat: applause, room noise, everyone at once
+OFF_MIC = "off-mic"     # quiet throughout: below where the microphone heard
 # A rewind is repaired by deleting what a chunk decoded past its seam, not by
 # decoding anything, so it never joins the kinds above and never costs a window.
 SEAM_TRIMMED = "seam overrun trimmed"
+# Nor does the same overrun at the end of the recording, where there is no next
+# chunk for the timestamps to run backwards into.
+TAIL_TRIMMED = "tail past the end of the audio trimmed"
+# Neither of those spends a window, and neither does declining to re-decode a
+# window a previous pass already exhausted without splicing anything.
+NOT_RETRIED = "not retried: nothing was spliced last time"
+FREE_OF_DECODE = (SEAM_TRIMMED, TAIL_TRIMMED, NOT_RETRIED)
+
+
+class GapGate(NamedTuple):
+    """
+    Which gaps a decode could actually recover. CLAUDE.md's triage, as numbers.
+
+    A gap over sound is not automatically dropped speech, and the level cannot
+    tell you which it is — applause is as loud as a sentence. The dynamics can:
+    applause and room noise sit flat second to second, speech swings 10–20 dB.
+    Two of the three buckets that produces are not repairs at all:
+
+      loud and flat     applause, room noise, the whole room talking at once.
+                        Running Whisper over it is precisely how a line of
+                        boilerplate ends up stamped over a round of applause.
+      quiet throughout  speech off the microphone, below where the VAD engages.
+                        A plain re-decode returns nothing; amplifying first and
+                        decoding that was tried on the recording these numbers
+                        come from, and returned the surrounding speech
+                        re-transcribed into the gap. Neither is recoverable in
+                        post — that fix is at record time.
+
+    What is left, mid-level with speech's own swing, is the bucket worth a
+    decode and the one --include-gaps still targets.
+
+    The defaults are the measured numbers from CLAUDE.md, and they are flags
+    rather than constants because on that recording they cut through the middle
+    of the data: several gaps sat a few tenths of a dB either side of the 9 dB
+    spread line, so which side of it they land on is a decision worth being
+    able to move without editing this file.
+    """
+    ambient_peak_db: float = -28.0
+    ambient_spread_db: float = 9.0
+    off_mic_peak_db: float = -32.0
+
+    def bucket(self, lvl):
+        """
+        AMBIENT, OFF_MIC or "gap" for a measured stretch — or None where the
+        dynamics could not be measured at all.
+
+        None means *fall back to the level*, not "assume the worst". A gap too
+        short to hold two whole seconds, or an ffmpeg that cannot slice, leaves
+        no spread to read; deciding a bucket on the peak alone in that case
+        would let one unsupported filter silently reclassify every gap in a
+        recording at once, and OFF_MIC — quiet, and otherwise decided on the
+        peak alone — is exactly the bucket that would swallow them. So both
+        buckets want a spread, and without one nothing here decides anything.
+        """
+        if lvl is None or lvl.peak is None or lvl.spread is None:
+            return None
+        if lvl.peak > self.ambient_peak_db and lvl.spread < self.ambient_spread_db:
+            return AMBIENT
+        if lvl.peak < self.off_mic_peak_db:
+            return OFF_MIC
+        return "gap"
+
+
+# One instance, shared by the dataclass default, the CLI defaults and the help
+# text, so the number a run uses and the number --help promises cannot drift.
+DEFAULT_GATE = GapGate()
 
 
 @dataclass
@@ -89,6 +173,10 @@ class RepairOptions:
     min_run: int = 3
     min_gap: float = 5.0
     check_audio: bool = True
+    # Which gaps the audio says a decode could recover. Carried here rather
+    # than read at the point of use so that the scan inside a repair run and
+    # the `verify` that judges it afterwards gate on the same numbers.
+    gate: GapGate = DEFAULT_GATE
 
 
 # ── Defect detection ───────────────────────────────────────────────────────────
@@ -114,34 +202,164 @@ class Defect:
                 f"({self.end - self.start:.1f}s) {self.detail}")
 
 
-def audio_level(audio_path, start, end):
-    """Mean/max dB and total detected silence for a stretch of audio."""
-    dur = max(0.05, end - start)
+class Level(NamedTuple):
+    """What one measurement of a stretch of audio says about it."""
+    mean: Optional[float]
+    peak: Optional[float]
+    silence: float
+    dur: float
+    peaks: tuple = ()           # the peak of each one-second slice, in order
+
+    @property
+    def spread(self):
+        """
+        dB between the quietest second and the loudest.
+
+        Level alone does not tell speech from applause — both are loud. What
+        separates them is the dynamics: applause and room noise sit flat, and
+        speech swings 10–20 dB second to second. That is the triage in
+        CLAUDE.md, and GapGate above is where it is applied. None where there
+        are not two whole seconds to compare, which is a fact about the
+        measurement and never a verdict — see GapGate.bucket.
+        """
+        return max(self.peaks) - min(self.peaks) if len(self.peaks) > 1 else None
+
+
+# One spawn, asked for everything at once. silencedetect and volumedetect
+# summarise the whole span on stderr; astats, downstream of them and so unable
+# to disturb what they see, prints a peak per slice on stdout. The resample and
+# asetnsamples are what make a slice a second of audio rather than however many
+# samples the container's own frames happen to hold.
+LEVEL_FILTERS = "silencedetect=noise=-40dB:d=0.5,volumedetect"
+SLICE_FILTERS = (",aresample=16000,asetnsamples=n=16000:p=0,"
+                 "astats=metadata=1:reset=1,"
+                 "ametadata=print:key=lavfi.astats.Overall.Peak_level:file=-")
+
+# A scan measures every gap and diagnose_repair_verify scans three or four
+# times a run, mostly over gaps no splice went near. Keyed on the span rather
+# than on the defect, so a re-derived gap that lands in the same place is
+# recognised; a gap a repair actually moved gets measured again, as it must.
+_LEVEL_CACHE = {}
+
+
+def parse_peak_levels(text, dur=None):
+    """
+    The per-slice peaks out of one ametadata print.
+
+    A digitally silent slice reports -inf, which is not a number and would
+    swamp any spread computed with it, so it is left out. So is the remainder
+    slice at the end of a span that did not divide evenly: a peak measured over
+    a fraction of a second is not comparable with one measured over a whole one.
+    """
+    peaks = [float(x) for x in re.findall(r"Peak_level=(-?\d+\.?\d*)", text)]
+    if dur and len(peaks) > 1 and len(peaks) > int(dur):
+        peaks = peaks[:-1]
+    return tuple(peaks)
+
+
+def _run_level(audio_path, start, dur, per_slice=True):
+    """One ffmpeg measuring pass. Returns (stderr, stdout)."""
     r = subprocess.run(
         ["ffmpeg", "-hide_banner", "-nostdin",
          "-ss", str(start), "-t", str(dur), "-i", str(audio_path),
-         "-af", "silencedetect=noise=-40dB:d=0.5,volumedetect",
+         "-af", LEVEL_FILTERS + (SLICE_FILTERS if per_slice else ""),
          "-f", "null", "-"],
         capture_output=True, text=True,
     )
-    err = r.stderr
+    return r.stderr, r.stdout
+
+
+def _measure_level(audio_path, start, dur):
+    err, out = _run_level(audio_path, start, dur)
+    if "mean_volume:" not in err:
+        # The per-slice filters are the only new thing in that chain, and an
+        # ffmpeg that rejects one of them fails the whole command — which would
+        # leave every gap unmeasured, and an unmeasured gap is reported as
+        # speech. Classification rides on the level, so the level gets its own
+        # attempt without them. Costs a second spawn only where the first
+        # failed, i.e. never on a build that can do both.
+        err, out = _run_level(audio_path, start, dur, per_slice=False)
     mean = re.search(r"mean_volume: ([-\d.]+) dB", err)
     peak = re.search(r"max_volume: ([-\d.]+) dB", err)
     silence = sum(float(x) for x in re.findall(r"silence_duration: ([\d.]+)", err))
-    return (float(mean.group(1)) if mean else None,
-            float(peak.group(1)) if peak else None,
-            silence, dur)
+    return Level(float(mean.group(1)) if mean else None,
+                 float(peak.group(1)) if peak else None,
+                 silence, dur, parse_peak_levels(out, dur))
+
+
+def audio_level(audio_path, start, end):
+    """
+    Mean/max dB, total detected silence, and a peak per second for a stretch of
+    audio. Memoised on the span, so a stretch survives a scan without being
+    re-measured by the next one.
+    """
+    dur = max(0.05, end - start)
+    key = (str(audio_path), round(start, 2), round(dur, 2))
+    if key not in _LEVEL_CACHE:
+        _LEVEL_CACHE[key] = _measure_level(audio_path, start, dur)
+    return _LEVEL_CACHE[key]
 
 
 def gap_is_speech(audio_path, start, end, quiet_db=-50.0, silence_ratio=0.75):
-    """True if there is audible content under a gap (i.e. dropped speech)."""
-    mean, peak, silence, dur = audio_level(audio_path, start, end)
-    if mean is None:
+    """
+    True if there is audible content under a gap (i.e. anything at all).
+
+    Level and silence only: this answers "is there sound here", which is the
+    one question a level can answer. Which *kind* of sound it is belongs to
+    GapGate, and classify_gap puts the two together. Kept apart because this
+    half still has to stand on its own — where the dynamics cannot be measured
+    it is the whole answer.
+    """
+    lvl = audio_level(audio_path, start, end)
+    if lvl.mean is None:
         return True, "could not measure"
-    why = f"mean {mean:.1f}dB, peak {peak:.1f}dB, {silence:.1f}s/{dur:.0f}s silent"
-    if silence / dur > silence_ratio or mean < quiet_db:
+    spread = lvl.spread
+    why = (f"mean {lvl.mean:.1f}dB, peak {lvl.peak:.1f}dB, "
+           + (f"spread {spread:.1f}dB over {len(lvl.peaks)}×1s, "
+              if spread is not None else "")
+           + f"{lvl.silence:.1f}s/{lvl.dur:.0f}s silent")
+    if lvl.silence / lvl.dur > silence_ratio or lvl.mean < quiet_db:
         return False, why
     return True, why
+
+
+# What each verdict looks like on the diagnosis. Every one of them carries the
+# measurement that produced it: these are decisions made about somebody's
+# recording on three numbers, and the numbers are how you argue with them.
+GAP_DETAIL = {
+    "silence": "silent — ignoring ({why})",
+    "gap": "speech under gap ({why})",
+    AMBIENT: ("loud but flat — applause, room noise or the room at once, not "
+              "dropped speech ({why})"),
+    OFF_MIC: ("quiet throughout — off-mic speech the recording never captured "
+              "({why})"),
+}
+
+
+def classify_gap(audio_path, start, end, gate=DEFAULT_GATE,
+                 quiet_db=-50.0, silence_ratio=0.75):
+    """
+    What a gap is, from the audio underneath it. Returns (kind, why).
+
+    Level first, because a gap over nothing is a pause and the transcript is
+    right to have nothing there. Then the dynamics, which are what separate
+    speech from the two kinds of loud-or-quiet sound no decode can turn into
+    words. A gap the gate cannot bucket keeps the level's own verdict.
+    """
+    speech, why = gap_is_speech(audio_path, start, end, quiet_db, silence_ratio)
+    if not speech:
+        return "silence", why
+    return gate.bucket(audio_level(audio_path, start, end)) or "gap", why
+
+
+# A lone word this short, repeated, is how people talk rather than how Whisper
+# breaks: "no no no no", "yes yes yes yes", "and and and and". Each false
+# positive costs a ~15s decode that can replace correct text with worse text,
+# and the segment-level loop detector still catches the same word repeated
+# across segments. A repeated *phrase* is exempt — "the budget the budget the
+# budget" is nobody's emphasis — and so is a short word repeated often enough
+# that its pairs repeat too (eight of them match at n=2).
+MIN_STUTTER_WORD = 5
 
 
 def find_stutters(segments, min_reps=4):
@@ -152,7 +370,7 @@ def find_stutters(segments, min_reps=4):
         for n in range(1, 7):
             for st in range(max(0, len(words) - n * min_reps + 1)):
                 phrase = words[st:st + n]
-                if len(" ".join(phrase)) <= 2:
+                if n == 1 and len(phrase[0]) < MIN_STUTTER_WORD:
                     continue
                 reps = 1
                 while words[st + reps * n:st + (reps + 1) * n] == phrase:
@@ -166,7 +384,42 @@ def find_stutters(segments, min_reps=4):
     return out
 
 
-def diagnose(segments, audio_path=None, min_run=3, min_gap=5.0, check_audio=True):
+# Whisper pads its final 30-second window with silence and rounds its
+# timestamps, so the last segment can end a shade past where the file does
+# without anything having been invented. A second is comfortably clear of that
+# and nowhere near an overrun worth the name — the one this was written for ran
+# 27 seconds past the end of its chunk's audio.
+TAIL_TOLERANCE = 1.0
+
+
+def tail_overrun(segments, audio_path, tolerance=TAIL_TOLERANCE):
+    """
+    What a decode stamped past the end of the recording. Returns
+    (duration, invented) or None.
+
+    `diagnose` only ever looks between consecutive segments, so the final chunk
+    has nothing after it to give an overrun away — no next chunk means no
+    backwards jump. It shows up instead as a transcript outlasting its own
+    audio, and the argument for deleting it is the seam argument exactly: the
+    audio stops, so anything stamped after it was never heard.
+
+    Reading the container's duration is metadata rather than a measuring pass,
+    so this is not gated on --no-audio-check the way the trim is: knowing costs
+    nothing, and the flag turns off repairs, not reports.
+    """
+    if not segments or not audio_path:
+        return None
+    try:
+        duration = T.get_duration(audio_path)
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError):
+        return None                     # unmeasurable: report nothing, guess nothing
+    if max(s["end"] for s in segments) <= duration + tolerance:
+        return None
+    return duration, [s for s in segments if s["end"] > duration]
+
+
+def diagnose(segments, audio_path=None, min_run=3, min_gap=5.0, check_audio=True,
+             gate=DEFAULT_GATE):
     """Find every defect in a transcript. Returns a list of Defect."""
     defects = []
 
@@ -194,11 +447,12 @@ def diagnose(segments, audio_path=None, min_run=3, min_gap=5.0, check_audio=True
             continue
         a, b = segments[i - 1]["end"], segments[i]["start"]
         if check_audio and audio_path:
-            speech, why = gap_is_speech(audio_path, a, b)
-            if not speech:
-                defects.append(Defect("silence", a, b, f"silent — ignoring ({why})"))
-                continue
-            defects.append(Defect("gap", a, b, f"speech under gap ({why})"))
+            # Four verdicts, one of them repairable. The other three are each
+            # reported with their measurement and cost no decode: a pause, a
+            # loud flat stretch that is not speech, and speech the microphone
+            # never got. Only the middle bucket is a window worth spending.
+            kind, why = classify_gap(audio_path, a, b, gate)
+            defects.append(Defect(kind, a, b, GAP_DETAIL[kind].format(why=why)))
         else:
             defects.append(Defect("gap", a, b, "unmeasured gap"))
 
@@ -208,6 +462,18 @@ def diagnose(segments, audio_path=None, min_run=3, min_gap=5.0, check_audio=True
             defects.append(Defect("rewind", segments[i]["start"], segments[i]["end"],
                                   "timestamps go backwards (chunk merge artefact)"))
 
+    # The same overrun at the end of the file, where nothing follows it to make
+    # the timestamps run backwards. Deleted rather than decoded, so like a
+    # rewind it is reported here and repaired elsewhere.
+    found = tail_overrun(segments, audio_path)
+    if found:
+        duration, invented = found
+        past = max(s["end"] for s in invented) - duration
+        defects.append(Defect(
+            "tail", duration, duration + past,
+            f"{len(invented)} segment(s) run {past:.0f}s past the end of the "
+            f"audio at {T.fmt_time(duration)}"))
+
     defects.sort(key=lambda d: d.start)
     return defects
 
@@ -216,8 +482,13 @@ def merge_windows(windows, join_within=5.0):
     """Coalesce windows that touch or nearly touch, so we decode each stretch once."""
     if not windows:
         return []
-    out = [list(windows[0])]
-    for start, end in sorted(windows)[1:]:
+    # Sort once and seed from the sorted list. Seeding from windows[0] while
+    # walking sorted(windows)[1:] silently dropped whichever window sorted
+    # first when the caller handed them over out of order — a defect that would
+    # never be decoded and never be mentioned.
+    ordered = sorted(windows)
+    out = [list(ordered[0])]
+    for start, end in ordered[1:]:
         if start - out[-1][1] <= join_within:
             out[-1][1] = max(out[-1][1], end)
         else:
@@ -235,7 +506,11 @@ def attempt_window(audio_path, window, opts, attempt):
         chunk_mins=opts.chunk_mins,
     )
     problems = []
-    if T.find_repeats(segs):
+    # The same threshold the diagnosis used. Judging the re-decode by the
+    # default while the scan used --min-run would call a window "still looping"
+    # that the final check then calls clean — two escalation decodes spent, and
+    # under --strict a refusal to splice a result nothing objects to.
+    if T.find_repeats(segs, opts.min_run):
         problems.append("still looping")
     if not segs:
         problems.append("came back empty")
@@ -265,7 +540,12 @@ def repair_window(audio_path, window, opts):
         if not problems:
             return segs, []
         print(f"      → {'; '.join(problems)}")
-        if best is None or len(problems) < len(best_problems):
+        # An empty decode is never a candidate, however few problems it has to
+        # its name: splicing nothing in place of the original deletes text that
+        # was there. Whisper returning no segments is the ordinary outcome on a
+        # quiet or off-mic window, so this is the common path, not the odd one.
+        # Leaving `best` as None hands the window to the leaving-as-is branch.
+        if segs and (best is None or len(problems) < len(best_problems)):
             best, best_problems = segs, problems
     return best, best_problems
 
@@ -282,11 +562,16 @@ def defect_windows(defects, join_within=5.0, kinds=REPETITION_KINDS):
     return merge_windows([(d.start, d.end) for d in targets], join_within)
 
 
-def repair(audio_path, segments, windows, opts, dry_run=False):
+def repair(audio_path, segments, windows, opts, dry_run=False, skip=()):
     """
     Re-transcribe each window and splice it into `segments`. This is the only
     place a window gets decoded and merged — automatic (windows from diagnose)
     and manual (windows from -w) repairs both come through here.
+
+    `skip` holds windows an earlier pass already exhausted without splicing
+    anything; they are reported rather than decoded a second time. The test is
+    made here because it is made against the *snapped* window, which is the one
+    that was really attempted.
 
     Returns (segments, report) where a report row is
     (window, status, spliced, old_words, new_words).
@@ -302,6 +587,12 @@ def repair(audio_path, segments, windows, opts, dry_run=False):
         before = [s for s in segments if s["end"] > target[0] and s["start"] < target[1]]
         old_words = sum(len(s["text"].split()) for s in before)
 
+        if target in skip:
+            print("    ↷ every attempt was spent on this window already and "
+                  "nothing was spliced — not decoding it again\n")
+            report.append((target, NOT_RETRIED, False, old_words, old_words))
+            continue
+
         if dry_run:
             print(f"    would replace {len(before)} segments ({old_words} words):")
             for s in before[:6]:
@@ -313,7 +604,7 @@ def repair(audio_path, segments, windows, opts, dry_run=False):
             continue
 
         new, problems = repair_window(audio_path, target, opts)
-        if new is None:
+        if not new:
             print("    ✗ no usable output — leaving as is\n")
             report.append((target, "failed", False, old_words, old_words))
             continue
@@ -328,8 +619,12 @@ def repair(audio_path, segments, windows, opts, dry_run=False):
 
         segments, removed = T.splice(segments, target, new)
         status = "repaired" if not problems else "partial: " + "; ".join(problems)
-        print(f"    ✓ {len(removed)} segments ({old_words} words) → "
-              f"{len(new)} segments ({new_words} words)\n")
+        # A partial splice is spliced all the same, so it needs a mark of its
+        # own: a tick against a window that came back still looping is what
+        # makes the "windows clean" count easier to read than the truth.
+        print(f"    {'✓' if not problems else '⚠'} {len(removed)} segments "
+              f"({old_words} words) → {len(new)} segments ({new_words} words)"
+              + (f" — {'; '.join(problems)}" if problems else "") + "\n")
         report.append((target, status, True, old_words, new_words))
 
     return segments, report
@@ -370,6 +665,41 @@ def trim_seams(audio_path, segments, opts, dry_run=False):
     return (segments if dry_run else trimmed), trims
 
 
+def trim_tail(audio_path, segments, opts, dry_run=False):
+    """
+    Delete what the last chunk decoded past the end of the recording. Returns
+    (segments, trim), a trim being (duration, dropped, clamped).
+
+    The seam rules, for the one seam that is the end of the file. A segment
+    stamped entirely after the audio ends is invented and goes; one straddling
+    the end is clamped instead, because with no chunk after it those words
+    exist nowhere else — the same rule clamp_to_chunk applies at merge time,
+    written out here rather than borrowed so that nothing outside the overrun
+    is touched. Free: nothing is decoded, and like the seam trim it runs before
+    any window is chosen.
+
+    Needs the audio. Without it, or under --no-audio-check, the overrun is
+    reported and left alone — the conservative default rewinds already take.
+    """
+    found = tail_overrun(segments, audio_path)
+    if not found:
+        return segments, None
+    duration, invented = found
+    dropped = [s for s in invented if s["start"] >= duration]
+    clamped = [s for s in invented if s["start"] < duration]
+    if not opts.check_audio:
+        print(f"\n{len(invented)} segment(s) past the end of the audio left alone "
+              f"— trimming them is an audio-confirmed repair and the audio check "
+              f"is off.")
+        return segments, None
+    print_tail_trim(duration, dropped, clamped, dry_run)
+    if dry_run:
+        return segments, (duration, dropped, clamped)
+    kept = [s if s["end"] <= duration else dict(s, end=duration)
+            for s in segments if s["start"] < duration]
+    return kept, (duration, dropped, clamped)
+
+
 def diagnose_repair_verify(audio_path, segments, opts, windows=None,
                            dry_run=False, title="Repair"):
     """
@@ -381,7 +711,8 @@ def diagnose_repair_verify(audio_path, segments, opts, windows=None,
     the remaining defects being the final check nothing else is outstanding.
     """
     def scan(segs):
-        return diagnose(segs, audio_path, opts.min_run, opts.min_gap, opts.check_audio)
+        return diagnose(segs, audio_path, opts.min_run, opts.min_gap,
+                        opts.check_audio, opts.gate)
 
     print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
     print(f"Targeting: {', '.join(opts.targets)}")
@@ -398,19 +729,45 @@ def diagnose_repair_verify(audio_path, segments, opts, windows=None,
                sum(len(s["text"].split()) for s in tail), 0)
               for seam, tail in trims]
 
+    # And the same thing at the end of the file, for the same price.
+    segments, tail = trim_tail(audio_path, segments, opts, dry_run)
+    if tail:
+        duration, dropped, clamped = tail
+        report.append((
+            (duration, max(s["end"] for s in dropped + clamped)), TAIL_TRIMMED,
+            not dry_run, sum(len(s["text"].split()) for s in dropped), 0))
+
     defects = scan(segments)
     print_diagnosis(defects, segments, opts.targets)
 
+    # Windows whose repair plan was exhausted without splicing anything: strict
+    # refusing the result, or a decode that came back empty. Nothing about such
+    # a window changes — only a splice can change `segments` inside this loop,
+    # and there wasn't one — so the next pass would re-derive the same window,
+    # hand the same audio and the same options to a decoder that is greedy at
+    # temperature 0, and arrive back where it started, a decode later. A
+    # partial splice is a splice: that window's content did change and it stays
+    # eligible. Keyed on the snapped window actually attempted, so a window
+    # re-derived from a fresh diagnosis is recognised when it lands in the same
+    # place and re-decoded when it does not.
+    exhausted = set()
+
     for p in range(1, opts.passes + 1):
-        todo = (list(windows) if windows else
+        # Explicit windows are coalesced like derived ones. Two -w flags that
+        # overlap would otherwise be decoded separately, and the second splice
+        # — widened to whole segments — replaces the first one's output, so the
+        # first decode is paid for and then thrown away.
+        todo = (merge_windows(windows, opts.join_within) if windows else
                 defect_windows(defects, opts.join_within, opts.targets))
         if not todo:
             print(f"\nPass {p}: nothing left to repair.")
             break
         print(f"\n── Pass {p}/{opts.passes} " + "─" * 40)
         print(f"{len(todo)} decode window(s)\n")
-        segments, rep = repair(audio_path, segments, todo, opts, dry_run)
+        segments, rep = repair(audio_path, segments, todo, opts, dry_run, exhausted)
         report += rep
+        exhausted.update(w for w, status, spliced, _, _ in rep
+                         if not spliced and status != "dry-run")
         if dry_run or windows:
             break  # explicit windows are decoded once, not re-derived per pass
         defects = scan(segments)
@@ -444,7 +801,8 @@ def print_diagnosis(defects, segments, targets=REPETITION_KINDS):
 
     if not defects:
         print("No defects found.")
-    for kind in ("loop", "gap", "stutter", "canned", "silence", "rewind"):
+    for kind in ("loop", "gap", "stutter", "canned", "silence", AMBIENT, OFF_MIC,
+                 "rewind", "tail"):
         found = kinds.get(kind, [])
         if not found:
             continue
@@ -452,8 +810,29 @@ def print_diagnosis(defects, segments, targets=REPETITION_KINDS):
         # A rewind reaching the diagnosis is one the trim already declined: no
         # recording to check, or nothing under the seam to confirm it. Decoding
         # was never the fix for it either way.
+        #
+        # A silence is not a defect that went unrepaired either: the transcript
+        # is right to have nothing there, and the measurement says why.
+        #
+        # A tail is the same bargain as a rewind: text stamped after the audio
+        # ends, deleted rather than decoded, and only where the recording is
+        # there to say where it ends.
+        #
+        # The two gated buckets get the silence treatment and for the silence
+        # reason: neither is a repair anybody declined to make. Loud and flat is
+        # not dropped speech at all, and off-mic speech is not in the recording
+        # to be recovered — the numbers beside each row are the argument, and
+        # the flags are how you disagree with it.
         note = ("  — merge artefact, only trimmed where the recording confirms "
                 "the seam" if kind == "rewind"
+                else "  — correct behaviour, nothing to repair" if kind == "silence"
+                else "  — correct behaviour: loud but flat is applause or room "
+                     "noise, and decoding it invents text" if kind == AMBIENT
+                else "  — unrecoverable from this recording: below the "
+                     "microphone, so the fix is at record time, not another "
+                     "decode" if kind == OFF_MIC
+                else "  — decoded past the end of the recording, deleted rather "
+                     "than decoded" if kind == "tail"
                 else "" if kind in targets else "  — reported, not repaired")
         print(f"\n{kind.upper()}  ({len(found)}, {total:.0f}s total){note}")
         for d in found:
@@ -486,13 +865,26 @@ def print_trims(trims, found, dry_run=False):
             print(f"      … and {len(tail) - 2} more")
 
 
+def print_tail_trim(duration, dropped, clamped, dry_run=False):
+    past = max((s["end"] for s in dropped + clamped), default=duration) - duration
+    print(f"\nTAIL PAST THE END OF THE AUDIO — "
+          f"{'would drop' if dry_run else 'dropped'} {len(dropped)} segment(s) "
+          f"and {'would clamp' if dry_run else 'clamped'} {len(clamped)}, running "
+          f"{past:.0f}s past the recording's own end at {T.fmt_time(duration)}")
+    for s in (clamped + dropped)[:3]:
+        print(f"      [{T.fmt_time(s['start'])}] {s['text'][:60]}")
+    if len(dropped) + len(clamped) > 3:
+        print(f"      … and {len(dropped) + len(clamped) - 3} more")
+
+
 def print_report(report):
     if not report:
         return
     print("=" * 60)
-    # Seam trims are counted apart: they cost no window and can't come back
-    # dirty, so folding them in would flatter the decode success rate.
-    decoded = [r for r in report if r[1] != SEAM_TRIMMED]
+    # The rows that cost no decode are counted apart: a trim can't come back
+    # dirty and a window that wasn't re-decoded didn't come back at all, so
+    # folding either in would move the decode success rate on its own.
+    decoded = [r for r in report if r[1] not in FREE_OF_DECODE]
     ok = sum(1 for _, s, _, _, _ in decoded if s == "repaired")
     print(f"REPAIR SUMMARY — {ok}/{len(decoded)} windows clean"
           if decoded else "REPAIR SUMMARY")
@@ -509,13 +901,112 @@ def add_common(p):
     p.add_argument("--min-gap", type=float, default=5.0,
                    help="Untranscribed seconds before it counts as a gap (default: 5)")
     p.add_argument("--no-audio-check", dest="check_audio", action="store_false",
-                   help="Skip measuring audio under gaps (faster, less accurate)")
+                   help="Skip measuring audio under gaps (faster, less accurate) "
+                        "and skip confirming seams, which disables rewind "
+                        "trimming and the trim of a tail past the end of the "
+                        "recording — every gap is then reported as speech and "
+                        "no chunk overrun is deleted")
     # On diagnose/verify this decides the exit status, on repair which windows
     # are decoded — deliberately the same flag, so the gate and the repairer
     # never disagree about what counts as a defect worth acting on.
     p.add_argument("--include-gaps", action="store_true",
                    help="Also target gaps. Off by default: only repetitions "
                         "(loops, stutters, boilerplate) are re-decoded")
+    # The dynamics gate. These decide which gaps --include-gaps can even reach:
+    # a gap ruled applause or ruled off-mic is reported with its numbers and
+    # never becomes a window. Flags rather than constants because on the
+    # recording the defaults were measured on, three of the fifteen gaps sat
+    # within 0.3 dB of the spread line — the thresholds run through the data,
+    # not around it, so being able to move them is part of the tool.
+    p.add_argument("--ambient-peak-db", type=float,
+                   default=DEFAULT_GATE.ambient_peak_db, metavar="DB",
+                   help=f"A gap peaking above this and flatter than "
+                        f"--ambient-spread-db is applause, room noise or the "
+                        f"whole room at once — reported, never decoded "
+                        f"(default: {DEFAULT_GATE.ambient_peak_db}). Raise it "
+                        f"to send more loud gaps for a decode; lower it to "
+                        f"leave more of them alone")
+    p.add_argument("--ambient-spread-db", type=float,
+                   default=DEFAULT_GATE.ambient_spread_db, metavar="DB",
+                   help=f"dB between a gap's quietest and loudest second below "
+                        f"which it counts as flat, i.e. not speech "
+                        f"(default: {DEFAULT_GATE.ambient_spread_db}; speech "
+                        f"swings 10–20). Raise it to gate out more gaps, lower "
+                        f"it to decode more — real gaps sit either side of the "
+                        f"default, so a small move changes verdicts")
+    p.add_argument("--off-mic-peak-db", type=float,
+                   default=DEFAULT_GATE.off_mic_peak_db, metavar="DB",
+                   help=f"A gap peaking below this is speech off the "
+                        f"microphone, below where the VAD engages — reported, "
+                        f"never decoded, because a re-decode returns nothing "
+                        f"and amplifying first returns the neighbours "
+                        f"(default: {DEFAULT_GATE.off_mic_peak_db}). Lower it "
+                        f"to send quieter gaps for a decode anyway")
+
+
+def gate_from_args(args):
+    """
+    The gap gate this run's flags imply. One place, so that `verify`'s exit
+    status and `repair`'s window selection can never gate on different numbers
+    — the same reason --include-gaps is shared between them.
+    """
+    return GapGate(args.ambient_peak_db, args.ambient_spread_db,
+                   args.off_mic_peak_db)
+
+
+def fail(message):
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def require_file(path, resolver, directory, kind):
+    """
+    Resolve a bare name the way this repo lays files out, and insist it is
+    really there. A missing recording is otherwise indistinguishable from an
+    unmeasurable one: ffmpeg reports no level, so every gap reads as speech,
+    every seam goes unconfirmed and nothing is trimmed, and the run says none
+    of that happened. A missing transcript is a bare traceback out of the
+    loader.
+    """
+    resolved = resolver(path)
+    if not Path(resolved).exists():
+        fail(f"{kind} not found: {path} (looked in {directory}/ too)")
+    return resolved
+
+
+def check_settings(min_run, min_gap, passes, gate=DEFAULT_GATE):
+    """
+    Reject thresholds that ask for something incoherent. Each of these looks
+    like a tuning knob and is really an instruction to do the wrong thing to
+    the whole recording.
+    """
+    # Peaks are dBFS: 0 is full scale and nothing measures above it. A gate
+    # placed there or beyond is not a strict setting, it is a bucket that
+    # either everything or nothing falls into, and both are silent.
+    if gate.ambient_peak_db >= 0:
+        fail("--ambient-peak-db must be below 0 — peaks are dBFS and never "
+             "reach it, so no gap is ever loud enough and the applause bucket "
+             "is switched off while looking like it was merely tightened")
+    if gate.off_mic_peak_db >= 0:
+        fail("--off-mic-peak-db must be below 0 — every gap peaks below 0 dBFS, "
+             "so all of them read as off-mic and no gap is ever repairable")
+    if gate.ambient_spread_db <= 0:
+        fail("--ambient-spread-db must be greater than 0 — a spread is the "
+             "distance between two measurements and is never negative, so this "
+             "silently empties the applause bucket rather than narrowing it")
+    if gate.ambient_peak_db < gate.off_mic_peak_db:
+        fail("--ambient-peak-db must be at or above --off-mic-peak-db — below "
+             "it the two buckets overlap, and a gap would be both too loud to "
+             "be dropped speech and too quiet to have been heard at all")
+    if min_run < 2:
+        fail("--min-run must be at least 2 — a run of one identical line is "
+             "every segment, i.e. a request to re-decode the whole recording")
+    if min_gap <= 0:
+        fail("--min-gap must be greater than 0 — every pair of segments is at "
+             "least 0 seconds apart, so every one of them becomes a gap")
+    if passes < 1:
+        fail("--passes must be at least 1 — fewer repairs nothing at all and "
+             "still writes an output file")
 
 
 def main():
@@ -582,11 +1073,15 @@ re-decoded. Either way it is the same splice-and-recheck path.
     add_common(v)
 
     args = ap.parse_args()
+    gate = gate_from_args(args)
+    check_settings(args.min_run, args.min_gap, getattr(args, "passes", 1), gate)
     # Audio comes from local/, transcripts from output/ — a bare name on the
     # command line is looked up there rather than only in the cwd.
-    args.transcript = T.resolve_transcript(args.transcript)
+    args.transcript = require_file(args.transcript, T.resolve_transcript,
+                                   T.OUTPUT_DIR, "transcript")
     if getattr(args, "audio", None):
-        args.audio = T.resolve_input(args.audio)
+        args.audio = require_file(args.audio, T.resolve_input,
+                                  T.INPUT_DIR, "audio file")
     segments = T.load_timestamped(args.transcript)
     targets = REPAIRABLE_KINDS if args.include_gaps else REPETITION_KINDS
 
@@ -594,7 +1089,7 @@ re-decoded. Either way it is the same splice-and-recheck path.
         # diagnose takes audio positionally, verify as an optional flag; both
         # land on args.audio and both gate the exit status on what they find.
         defects = diagnose(segments, args.audio, args.min_run, args.min_gap,
-                           args.check_audio and bool(args.audio))
+                           args.check_audio and bool(args.audio), gate)
         print_diagnosis(defects, segments, targets)
         sys.exit(1 if any(d.kind in targets for d in defects) else 0)
 
@@ -605,7 +1100,7 @@ re-decoded. Either way it is the same splice-and-recheck path.
         pad=args.pad, chunk_mins=args.chunk_size, targets=targets,
         join_within=args.join_within,
         strict=args.strict, passes=args.passes, min_run=args.min_run,
-        min_gap=args.min_gap, check_audio=args.check_audio,
+        min_gap=args.min_gap, check_audio=args.check_audio, gate=gate,
     )
     print(f"Backend:  {opts.backend}  model={opts.model} "
           f"(fallback {opts.fallback_model})  chunk={opts.chunk_mins}min")

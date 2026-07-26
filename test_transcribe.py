@@ -1,8 +1,16 @@
+import contextlib
+import io
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
-from testlib import Checks, FIXTURE
+import testlib
+from testlib import (ROOT, Checks, FIXTURE, AUDIO_SILENCE, AUDIO_TONE,
+                     build_audio_fixture)
 import transcribe as T
 
 check = Checks()
@@ -40,8 +48,9 @@ check("dots in a recording name are not treated as an extension",
       T.default_output(Path("local/team.sync.2026-07-25.m4a")) ==
       T.OUTPUT_DIR / "team.sync.2026-07-25")
 check("a bare stem lands in output/", T.resolve_output("audio") == T.OUTPUT_DIR / "audio")
-check("an explicit directory is left alone",
-      T.resolve_output("elsewhere/audio") == Path("elsewhere/audio"))
+with contextlib.redirect_stderr(io.StringIO()):   # it warns; that is its own section
+    check("an explicit directory is left alone",
+          T.resolve_output("elsewhere/audio") == Path("elsewhere/audio"))
 check("resolve_output strips a transcript extension",
       T.resolve_output("audio.timestamped.txt") == T.OUTPUT_DIR / "audio")
 check("a bare transcript name is found in output/",
@@ -55,6 +64,94 @@ with tempfile.TemporaryDirectory() as d:
           T._resolve_in("nope.m4a", Path(d)) == Path("nope.m4a"))
     check("a path with a directory in it is never redirected",
           T._resolve_in("sub/clip.m4a", Path(d)) == Path("sub/clip.m4a"))
+
+check.section("measuring real audio (everything else here stubs ffmpeg)")
+# The silence-detection and duration helpers are the only part of this module
+# that talks to a real recording, and repair's seam check trusts what they say:
+# if the times came back relative to the seek instead of on the file's own
+# clock, no seam would ever be confirmed, rewinds would silently stop being
+# trimmed, and every stubbed test in all three suites would still pass.
+audio = build_audio_fixture()
+if audio is None:
+    check.skip("silence, duration and extraction measured against real audio",
+               "ffmpeg is not installed")
+else:
+    tone_secs = AUDIO_TONE[1] - AUDIO_TONE[0]
+    quiet_start, quiet_end = AUDIO_SILENCE
+    full_secs = quiet_end + tone_secs          # tone, silence, tone
+
+    ends = T.silence_ends(audio)
+    check("the one silence in the fixture is found, and only that one",
+          len(ends) == 1, ends)
+    check("it ends where the fixture stops being quiet",
+          ends and abs(ends[0] - quiet_end) < 0.05, ends)
+
+    scan_from = quiet_start + tone_secs / 2    # starts inside the silence
+    shifted = T.silence_ends(audio, scan_from, tone_secs)
+    check("scanning a stretch reports file time, not time since the seek — "
+          "repair reads these as chunk boundaries before it deletes anything",
+          shifted and abs(shifted[0] - quiet_end) < 0.05, (scan_from, shifted))
+    check("and the shift is forward onto the file's clock, never back off it",
+          all(s >= scan_from for s in shifted), (scan_from, shifted))
+
+    check("the file's duration is what was generated",
+          abs(T.get_duration(audio) - full_secs) < 0.05, T.get_duration(audio))
+
+    with tempfile.TemporaryDirectory() as d:
+        copy = Path(d) / "copy.wav"
+        shutil.copy(audio, copy)
+        first = T.get_duration(copy)
+        copy.unlink()
+        try:
+            again = T.get_duration(copy)
+        except Exception as e:
+            again = f"re-probed and failed: {e}"
+        check("a duration is probed once and remembered — the window path asks "
+              "for it on every decode attempt of every slice",
+              again == first, again)
+
+        dashed = Path(d) / "-clip.wav"
+        shutil.copy(audio, dashed)
+        cwd = os.getcwd()
+        try:
+            os.chdir(d)
+            got = T.get_duration("-clip.wav")
+        except Exception as e:
+            got = f"ffprobe rejected it: {e}"
+        finally:
+            os.chdir(cwd)
+        check("a filename beginning with '-' is a filename, not an ffprobe option",
+              isinstance(got, float) and abs(got - full_secs) < 0.05, got)
+
+        # Where the chunk is cut out of matters more than how fast: the input
+        # seek this asserts is also the one that decides which audio arrives.
+        clip_start = quiet_start + tone_secs / 2
+        clip = Path(d) / "clip.wav"
+        T.extract_chunk(audio, clip_start, tone_secs, clip)
+        check("an extracted chunk is as long as it was asked to be",
+              abs(T.get_duration(clip) - tone_secs) < 0.1, T.get_duration(clip))
+        clip_ends = T.silence_ends(clip)
+        check("and it holds the stretch that was asked for — the fixture's "
+              "silence ends at the same moment, measured from the chunk's start",
+              clip_ends and abs(clip_ends[0] - (quiet_end - clip_start)) < 0.1,
+              (clip_start, clip_ends))
+
+    # The speed of it is a property of where -ss sits in the command line.
+    class _Recorder:
+        cmd = None
+        def run(self, cmd, **kw):
+            self.cmd = cmd
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+    rec, real_subprocess = _Recorder(), T.subprocess
+    try:
+        T.subprocess = rec
+        T.extract_chunk("in.m4a", 3600.0, 30.0, "out.wav")
+    finally:
+        T.subprocess = real_subprocess
+    check("the seek happens before the input, so ffmpeg jumps to the chunk "
+          "instead of decoding an hour of audio and discarding it",
+          rec.cmd.index("-ss") < rec.cmd.index("-i")
+          and rec.cmd.index("-t") < rec.cmd.index("-i"), rec.cmd)
 
 check.section("parse_time / parse_window")
 check("HH:MM:SS", T.parse_time("1:49:54") == 6594.0)
@@ -352,5 +449,403 @@ orphan = merged[:3] + [{"start": 300.0, "end": 301.0, "text": "only a second of 
 check("a sparse next chunk does not save the tail",
       T.trim_seam_overruns(orphan)[1] == [(300.0, [merged[2]])],
       T.trim_seam_overruns(orphan)[1])
+
+check.section("splicing a window that overlaps nothing (a gap)")
+# A gap window has, by definition, no segment to take the place of. Deriving the
+# insertion point from the first overlapping segment therefore found none and
+# appended the replacement after everything — including everything later in the
+# file — so the next diagnose scan read the backwards jump as a rewind and spent
+# a decode on a window that was never wrong.
+base = [{"start": 0.0, "end": 5.0, "text": "before the gap"},
+        {"start": 100.0, "end": 105.0, "text": "after the gap"}]
+filled, removed4 = T.splice(base, (50.0, 60.0),
+                            [{"start": 52.0, "end": 55.0, "text": "GAP FILL"}])
+check("nothing is removed, because nothing overlapped",
+      removed4 == [], removed4)
+check("the new lines land between their neighbours in time, not at the end",
+      [s["text"] for s in filled] == ["before the gap", "GAP FILL", "after the gap"],
+      [s["text"] for s in filled])
+check("so the spliced transcript is still non-decreasing in start — the "
+      "property whose violation manufactures a phantom rewind",
+      [s["start"] for s in filled] == sorted(s["start"] for s in filled),
+      [s["start"] for s in filled])
+lead, _ = T.splice(base, (-20.0, -10.0),
+                   [{"start": -15.0, "end": -12.0, "text": "EARLIEST"}])
+check("a window before everything is inserted first",
+      [s["text"] for s in lead][0] == "EARLIEST", [s["text"] for s in lead])
+tail4, _ = T.splice(base, (200.0, 210.0),
+                    [{"start": 202.0, "end": 205.0, "text": "LATEST"}])
+check("a window after everything still goes last",
+      [s["text"] for s in tail4][-1] == "LATEST", [s["text"] for s in tail4])
+check("an empty replacement for a window that hit nothing changes nothing",
+      T.splice(base, (50.0, 60.0), []) == (base, []))
+# The insertion index used to be counted twice over: the first overlapping
+# index, then a count of the non-hits before it. They are the same number,
+# because every segment before the first hit is a keeper — and the overlapping
+# case must still land exactly there.
+mid = base + [{"start": 200.0, "end": 205.0, "text": "later still"}]
+over4, rem4b = T.splice(mid, (99.0, 106.0),
+                        [{"start": 100.0, "end": 105.0, "text": "REDONE"}])
+check("an overlapping window replaces its segments in place, where the old "
+      "ones were",
+      [s["text"] for s in over4] == ["before the gap", "REDONE", "later still"],
+      [s["text"] for s in over4])
+check("and reports exactly what it took out",
+      [s["text"] for s in rem4b] == ["after the gap"], rem4b)
+first_only, _ = T.splice(mid, (0.0, 6.0),
+                         [{"start": 1.0, "end": 2.0, "text": "OPENING"}])
+check("a window over the very first segment keeps the replacement first",
+      [s["text"] for s in first_only][0] == "OPENING",
+      [s["text"] for s in first_only])
+
+check.section("a silence at the end of the file is not a chunk boundary")
+# silencedetect emits a silence_end at EOF whenever a recording fades out, and
+# snapping a cut to it appends the end twice: a final chunk of no audio at all,
+# extracted as a header-only WAV and handed to Whisper to transcribe nothing.
+fade = T.chunk_boundaries(0, 290, 60, [209.0, 290.0])
+check("no chunk is shorter than the smallest amount of audio worth decoding",
+      all(b - a >= T.MIN_CHUNK_SECS for a, b in zip(fade, fade[1:])),
+      [round(b - a, 3) for a, b in zip(fade, fade[1:])])
+check("the file is still covered end to end",
+      (fade[0], fade[-1]) == (0, 290), fade)
+check("a silence that is not at the end is still used as a cut",
+      209.0 in fade, fade)
+near = T.chunk_boundaries(0, 290, 60, [209.0, 289.9])
+check("nor is one a hair short of the end",
+      all(b - a >= T.MIN_CHUNK_SECS for a, b in zip(near, near[1:])),
+      [round(b - a, 3) for a, b in zip(near, near[1:])])
+# The window path splits on the same silences, so it has the same exposure:
+# a silence a cut can reach, and another at the window's own end.
+T.silence_ends = lambda p, start=None, dur=None: [start + 209.0, start + dur]
+faded = T.window_slices("fake.m4a", 0.0, 290.0, 60)
+check("a repair window that fades out at its end is sliced the same way",
+      all(b - a >= T.MIN_CHUNK_SECS for a, b in zip(faded, faded[1:])),
+      [round(b - a, 3) for a, b in zip(faded, faded[1:])])
+check("and still covers the whole window",
+      (faded[0], faded[-1]) == (0.0, 290.0), faded)
+check.raises("a chunk size of zero is refused rather than looping forever "
+             "building boundaries until memory runs out",
+             T.chunk_boundaries, 0, 300, 0, [])
+check.raises("and so is a negative one", T.chunk_boundaries, 0, 300, -5, [])
+
+check.section("one loaded model per process, not one per decode")
+# whisper.load_model reads a multi-hundred-MB checkpoint. The window path used
+# to hand the backend a fresh {} on every call, so a repair reloaded the model
+# for every slice of every attempt of every window.
+T._OPENAI_CACHE.clear()
+loads = []
+def counting_backend(path, backend, model, lang, cache, cond=True):
+    if model not in cache:
+        cache[model] = object()          # what whisper.load_model costs, in effigy
+        loads.append(model)
+    return {"segments": [{"start": 0.0, "end": 2.0, "text": "decoded"}]}
+T.extract_chunk = lambda a, s, d, o: Path(o).write_text("x")
+T._run_backend = counting_backend
+T.get_duration = lambda p: 3600.0
+for span in ((0.0, 30.0), (30.0, 60.0)):
+    T._decode_span("fake.m4a", span, 3600.0, "openai", "medium", "en",
+                   0.0, 0.0, False)
+check("a second slice reuses the model the first one loaded",
+      loads == ["medium"], loads)
+check("because the cache it is handed is the module's, not a new dict",
+      "medium" in T._OPENAI_CACHE, list(T._OPENAI_CACHE))
+T.get_duration = lambda p: 600.0
+T.find_split_points = lambda p, c, d: [0.0, 300.0, 600.0]
+T.transcribe("fake.m4a", "openai", "medium", "en", 5)
+check("and the whole-file path shares it, so the repair pass that follows a "
+      "transcription loads nothing again", loads == ["medium"], loads)
+check("a different model is still loaded when one is asked for",
+      (T._decode_span("fake.m4a", (0.0, 5.0), 600.0, "openai", "tiny", "en",
+                      0.0, 0.0, False) is not None
+       and loads == ["medium", "tiny"]), loads)
+
+check.section("timestamps are truncated, never rounded into the next minute")
+check("a fraction under the minute stays inside it",
+      T.fmt_time(59.999) == "00:00:59.99", T.fmt_time(59.999))
+check("and under the hour too",
+      T.fmt_time(3599.996) == "00:59:59.99", T.fmt_time(3599.996))
+edges = [0.0, 0.29, 12.29, 59.999, 60.0, 119.9999, 3599.996, 3600.0, 3661.5]
+check("no stamp ever shows a sixtieth second",
+      all(int(T.fmt_time(t).split(":")[2].split(".")[0]) < 60 for t in edges),
+      [T.fmt_time(t) for t in edges])
+check("the fmt_srt_time it shares a file with already truncated",
+      (T.fmt_srt_time(59.999), T.fmt_srt_time(3599.996))
+      == ("00:00:59,999", "00:59:59,996"),
+      (T.fmt_srt_time(59.999), T.fmt_srt_time(3599.996)))
+check("the two formats agree on which second it is",
+      all(T.fmt_time(t)[:8] == T.fmt_srt_time(t)[:8] for t in edges),
+      [(T.fmt_time(t), T.fmt_srt_time(t)) for t in edges])
+check("a hundredth is not truncated away by binary float noise",
+      [T.fmt_time(t) for t in (0.29, 12.29, 3661.5)]
+      == ["00:00:00.29", "00:00:12.29", "01:01:01.50"],
+      [T.fmt_time(t) for t in (0.29, 12.29, 3661.5)])
+check("every stamp reads back as a time within a hundredth of the real one",
+      all(abs(sum(f * v for f, v in zip((3600, 60, 1),
+                                        (int(p[0]), int(p[1]), float(p[2]))))
+              - t) <= 0.01
+          for t in edges for p in [T.fmt_time(t).split(":")]),
+      [T.fmt_time(t) for t in edges])
+
+check.section("the CLI flags that were inert or unstated")
+P = T.build_parser()
+plain = P.parse_args(["audio.m4a"])
+check("timestamped output is still on by default", plain.timestamps is True)
+check("--no-timestamps is the off switch the help text implied existed",
+      P.parse_args(["audio.m4a", "--no-timestamps"]).timestamps is False)
+check("-t still asks for them", P.parse_args(["audio.m4a", "-t"]).timestamps is True)
+check("the model a stubborn window is retried with is named on the CLI",
+      plain.fallback_model == T.DEFAULT_FALLBACK_MODEL, plain.fallback_model)
+check("and can be pinned to a small one",
+      P.parse_args(["audio.m4a", "--fallback-model", "tiny"]).fallback_model == "tiny")
+# A stand-in for the repair module, so which flag lands on which option is
+# checkable without it. Its gate reader just echoes the three thresholds back:
+# assembling them is repair.py's job, and that it is really repair.py doing it
+# is asserted against the real module further down.
+fake_repair = SimpleNamespace(REPETITION_KINDS=("loop", "stutter", "canned"),
+                              REPAIRABLE_KINDS=("loop", "stutter", "canned", "gap"),
+                              gate_from_args=lambda a: (a.ambient_peak_db,
+                                                        a.ambient_spread_db,
+                                                        a.off_mic_peak_db))
+draft = T.repair_kwargs(P.parse_args(["audio.m4a", "--model", "tiny",
+                                      "--fallback-model", "tiny"]),
+                        "openai", fake_repair)
+check("a draft run's fallback model reaches the repair options, so --model "
+      "tiny cannot quietly fetch a multi-gigabyte checkpoint instead",
+      draft["fallback_model"] == "tiny", draft)
+check("the repair model defaults to the model the transcription used",
+      draft["model"] == "tiny", draft)
+check("--repair-model overrides just that",
+      T.repair_kwargs(P.parse_args(["audio.m4a", "--model", "tiny",
+                                    "--repair-model", "small"]),
+                      "openai", fake_repair)["model"] == "small")
+check("gaps are not re-decoded unless they are asked for",
+      draft["targets"] == fake_repair.REPETITION_KINDS, draft["targets"])
+check("--include-gaps widens what earns a decode",
+      T.repair_kwargs(P.parse_args(["audio.m4a", "--include-gaps"]),
+                      "openai", fake_repair)["targets"]
+      == fake_repair.REPAIRABLE_KINDS)
+check("repair slices its windows with the chunk size this run was given",
+      T.repair_kwargs(P.parse_args(["audio.m4a", "-c", "3"]),
+                      "openai", fake_repair)["chunk_mins"] == 3)
+check.raises("--chunk-size 0 is refused at the CLI rather than hanging the "
+             "chunker", P.parse_args, ["audio.m4a", "-c", "0"])
+check.raises("so is a negative chunk size", P.parse_args, ["audio.m4a", "-c", "-5"])
+check.raises("so is one that is not a number", P.parse_args, ["audio.m4a", "-c", "x"])
+check("a sane chunk size still parses",
+      P.parse_args(["audio.m4a", "-c", "1"]).chunk_size == 1)
+try:
+    import repair as _repair
+    from dataclasses import fields as _fields
+    names = {f.name for f in _fields(_repair.RepairOptions)}
+    unknown = set(T.repair_kwargs(plain, "openai", _repair)) - names
+    check("every option this CLI builds is one repair actually accepts",
+          unknown == set(), unknown)
+except Exception as e:
+    check.skip("every option this CLI builds is one repair actually accepts",
+               f"repair.py not importable here: {e}")
+
+check.section("the gap dynamics gate is tunable from the transcription path")
+# Every number below is read off repair.DEFAULT_GATE rather than written out
+# here: the property under test is that the two sides cannot be retuned
+# separately, and a literal -28.0 in this file would be a third copy to drift.
+# Guarded the same way as the cross-check above — with no repair.py there is
+# nothing to compare against.
+try:
+    import repair as _repair
+    from dataclasses import fields as _fields
+except Exception as e:
+    _repair = None
+    check.skip("the three gap thresholds are repair.py's own",
+               f"repair.py not importable here: {e}")
+if _repair is not None:
+    G = _repair.DEFAULT_GATE
+    check("all three thresholds are askable for here, and default to exactly "
+          "the numbers repair.py gates on — so neither side can be retuned "
+          "without the other",
+          (plain.ambient_peak_db, plain.ambient_spread_db, plain.off_mic_peak_db)
+          == (G.ambient_peak_db, G.ambient_spread_db, G.off_mic_peak_db),
+          (plain.ambient_peak_db, plain.ambient_spread_db,
+           plain.off_mic_peak_db, G))
+    ours = T.FlagRecorder()
+    T.add_gate_flags(ours, _repair)
+    theirs = T.FlagRecorder()
+    _repair.add_common(theirs)
+    check("and each is registered with repair.py's own type, metavar and help "
+          "text, so --help here promises what the repair pass will actually do",
+          {a[0]: kw for a, kw in ours.calls}
+          == {a[0]: kw for a, kw in theirs.calls if a[0] in T.GATE_FLAGS},
+          [a[0] for a, _ in ours.calls])
+    check.raises("a repair.py that renamed a threshold fails loudly rather "
+                 "than leaving a flag the help text still advertises",
+                 T.add_gate_flags, T.FlagRecorder(),
+                 SimpleNamespace(add_common=lambda p: p.add_argument(
+                     "--min-run", type=int, default=3)),
+                 expect=RuntimeError)
+
+    moved = P.parse_args(["audio.m4a",
+                          "--ambient-peak-db", str(G.ambient_peak_db + 3),
+                          "--ambient-spread-db", str(G.ambient_spread_db + 2),
+                          "--off-mic-peak-db", str(G.off_mic_peak_db - 4)])
+    tuned = _repair.RepairOptions(**T.repair_kwargs(moved, "openai", _repair))
+    check("a moved applause threshold reaches the options the automatic pass "
+          "runs with", tuned.gate.ambient_peak_db == G.ambient_peak_db + 3,
+          tuned.gate)
+    check("so does a moved spread threshold",
+          tuned.gate.ambient_spread_db == G.ambient_spread_db + 2, tuned.gate)
+    check("so does a moved off-mic threshold",
+          tuned.gate.off_mic_peak_db == G.off_mic_peak_db - 4, tuned.gate)
+    check("and they arrive as the gate repair classifies gaps with, not a "
+          "loose triple", isinstance(tuned.gate, _repair.GapGate),
+          type(tuned.gate).__name__)
+    # The point of the flags, end to end: the same measured stretch is bucketed
+    # differently because the transcription run said so. Loud and flat, just
+    # above the default applause line.
+    loud_flat = SimpleNamespace(peak=G.ambient_peak_db + 1,
+                                spread=G.ambient_spread_db - 1)
+    check("moving the line moves the verdict: a stretch the default gate calls "
+          "applause is repairable under the raised one this run asked for",
+          G.bucket(loud_flat) == _repair.AMBIENT
+          and tuned.gate.bucket(loud_flat) == "gap",
+          (G.bucket(loud_flat), tuned.gate.bucket(loud_flat)))
+
+    base = _repair.RepairOptions(**T.repair_kwargs(plain, "openai", _repair))
+    check("a run naming none of them gates on exactly what it gated on before "
+          "the flags existed", base.gate == _repair.RepairOptions().gate
+          and base.gate == _repair.DEFAULT_GATE, base.gate)
+    differing = {f.name for f in _fields(_repair.RepairOptions)
+                 if getattr(base, f.name)
+                 != getattr(_repair.RepairOptions(), f.name)}
+    check("so the gate is not among what such a run overrides at all",
+          "gate" not in differing, differing)
+
+    # Refused before a multi-hour transcription, not after: the run below names
+    # a recording that does not exist, so if the gate check were anywhere later
+    # the file error would be what came back instead.
+    def _cli(*flags):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "transcribe.py"),
+             "no-such-recording.m4a", *flags],
+            capture_output=True, text=True)
+    crossed = _cli("--ambient-peak-db", str(G.off_mic_peak_db - 1))
+    check("an applause threshold below the off-mic one — two buckets a gap "
+          "would fall into at once — is refused",
+          crossed.returncode == 1 and "--ambient-peak-db" in crossed.stderr,
+          (crossed.returncode, crossed.stderr[-300:]))
+    check("and refused before the recording is so much as looked for, let "
+          "alone decoded",
+          "not found" not in (crossed.stdout + crossed.stderr)
+          and "Audio:" not in crossed.stdout,
+          (crossed.stdout[-300:], crossed.stderr[-300:]))
+    flat = _cli("--ambient-spread-db", "0")
+    check("a spread of zero, which empties the applause bucket while looking "
+          "like it narrowed it, is refused too",
+          flat.returncode == 1 and "--ambient-spread-db" in flat.stderr,
+          (flat.returncode, flat.stderr[-300:]))
+    fine = _cli("--ambient-spread-db", str(G.ambient_spread_db + 1))
+    check("while a coherent retune is waved through to the recording it was "
+          "given, so the refusals above are about the gate and nothing else",
+          "not found" in fine.stderr, (fine.returncode, fine.stderr[-300:]))
+
+check.section("a transcript written outside output/ says so")
+def resolved(stem):
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        return T.resolve_output(stem), err.getvalue()
+inside = str(ROOT / "transcripts" / "meeting")
+path25, warned = resolved(inside)
+check("a repo path outside output/ is still honoured — the warning does not "
+      "refuse it", str(path25) == inside, path25)
+check("but it is called out, because output/ is the only gitignored place a "
+      "transcript can land in", "Warning" in warned and "gitignore" in warned,
+      warned)
+check("the ordinary case is silent", resolved("meeting") == (T.OUTPUT_DIR / "meeting", ""),
+      resolved("meeting"))
+check("naming output/ explicitly is silent too",
+      resolved(str(T.OUTPUT_DIR / "meeting"))[1] == "",
+      resolved(str(T.OUTPUT_DIR / "meeting")))
+check("so is a subdirectory of output/",
+      resolved(str(T.OUTPUT_DIR / "old" / "meeting"))[1] == "")
+with tempfile.TemporaryDirectory() as d:
+    check("somewhere else entirely on the disk is the author's own business",
+          resolved(str(Path(d) / "meeting"))[1] == "",
+          resolved(str(Path(d) / "meeting")))
+with contextlib.redirect_stderr(io.StringIO()):
+    check("the check says which it did, so it can be reasoned about",
+          T.warn_if_committable(ROOT / "notes" / "x") is True
+          and T.warn_if_committable(T.OUTPUT_DIR / "x") is False)
+
+check.section("transcript files are UTF-8 whatever the locale says")
+# Whisper output routinely contains non-ASCII, and backup_file round-trips a
+# whole transcript through a decode and an encode — under a non-UTF-8 locale a
+# default-encoding open would corrupt the very copy that undoes an in-place
+# repair. Proven in a child interpreter, because the encoding an open() picks
+# by default is fixed when the interpreter starts.
+child = f'''
+import locale, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, {str(ROOT)!r})
+enc = locale.getpreferredencoding(False)
+if "utf" in enc.lower().replace("-", ""):
+    print("SKIP " + enc)
+    raise SystemExit(0)
+import transcribe as T
+said = "caf\\u00e9 na\\u00efve \\u2014 \\u4f1a\\u8b70"
+with tempfile.TemporaryDirectory() as d:
+    stem = Path(d) / "meeting"
+    T.save_output({{"text": said,
+                   "segments": [{{"start": 0.0, "end": 1.0, "text": said}}]}},
+                  stem, True)
+    ts = Path(str(stem) + ".timestamped.txt")
+    assert said.encode("utf-8") in ts.read_bytes(), "not written as utf-8"
+    assert T.load_timestamped(ts)[0]["text"] == said, "did not read back"
+    assert T.backup_file(ts).read_bytes() == ts.read_bytes(), "backup differs"
+print("OK")
+'''
+r = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True,
+                   env=dict(os.environ, LC_ALL="C", LANG="C",
+                            PYTHONUTF8="0", PYTHONCOERCECLOCALE="0"))
+if r.stdout.startswith("SKIP"):
+    check.skip("saving, reading back and backing up non-ASCII speech",
+               f"this interpreter cannot be made non-UTF-8: {r.stdout.strip()}")
+else:
+    check("saving, reading back and backing up non-ASCII speech survives an "
+          "interpreter whose locale encoding is ASCII",
+          r.returncode == 0 and r.stdout.strip().endswith("OK"),
+          (r.stdout[-200:], r.stderr[-400:]))
+
+check.section("the harness protects itself")
+# Both of these guard the harness rather than transcribe.py, and both were
+# added without coverage because the shard that wrote them could not edit a
+# suite. They are here because a harness that silently lies is worse than no
+# harness: a truncated fixture would fail the real-audio checks above for a
+# reason that has nothing to do with the code under test.
+if audio is None:
+    check.skip("a half-written audio fixture is rebuilt, not reused",
+               "ffmpeg is not installed")
+else:
+    testlib.FIXTURE_AUDIO.write_bytes(b"RIFF truncated, as an interrupted ffmpeg leaves it")
+    rebuilt = testlib.build_audio_fixture()
+    check("a half-written audio fixture is rebuilt rather than cached forever",
+          rebuilt is not None
+          and abs(testlib._probe_duration(rebuilt) - testlib._AUDIO_FIXTURE_DURATION) < 0.5,
+          f"still {testlib._probe_duration(testlib.FIXTURE_AUDIO)}s after rebuild")
+
+# raises(expect=...) has to be checked on a throwaway Checks, because the
+# behaviour under test is a check *failing*.
+probe = testlib.Checks()
+with contextlib.redirect_stdout(io.StringIO()):
+    probe.raises("", lambda: (_ for _ in ()).throw(TypeError("wrong reason")),
+                 expect=ValueError)
+check("a rejection that raised for the wrong reason is not counted as the "
+      "rejection under test",
+      probe.failed == 1 and probe.ok == 0,
+      f"ok={probe.ok} failed={probe.failed}")
+
+probe = testlib.Checks()
+with contextlib.redirect_stdout(io.StringIO()):
+    probe.raises("", lambda: (_ for _ in ()).throw(ValueError("the right reason")),
+                 expect=ValueError)
+check("the expected exception type still passes", probe.ok == 1 and probe.failed == 0,
+      f"ok={probe.ok} failed={probe.failed}")
 
 check.finish()

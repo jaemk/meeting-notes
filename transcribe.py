@@ -62,6 +62,10 @@ BACKENDS = ["auto", "mlx", "openai"]
 # they share the default and repair.py takes the same -c flag.
 DEFAULT_CHUNK_MINS = 5
 
+# Below this a "chunk" is a WAV header with no audio in it: a model load, a
+# decode and a temp file, all to transcribe nothing.
+MIN_CHUNK_SECS = 0.5
+
 
 # ── Backend selection ──────────────────────────────────────────────────────────
 
@@ -122,13 +126,43 @@ def resolve_transcript(path):
     return _resolve_in(path, OUTPUT_DIR)
 
 
+def warn_if_committable(path):
+    """
+    Say so, loudly, when a transcript is about to be written somewhere in this
+    repo that git is not ignoring. Only output/ is gitignored, and save_output
+    creates whatever directory it is given, so `-o transcripts/mtg` quietly
+    stages somebody's meeting for the next commit. A path outside the repo is
+    the author's own business and passes without comment.
+
+    Returns True when it warned, so this is testable without reading stderr.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve()
+        resolved.relative_to(ROOT)              # inside the repo?
+    except (ValueError, OSError, RuntimeError):
+        return False
+    try:
+        resolved.relative_to(OUTPUT_DIR)        # ...and inside output/?
+        return False
+    except ValueError:
+        pass
+    print(f"Warning: {path} is inside the repo but not under {OUTPUT_DIR.name}/. "
+          f"Only {OUTPUT_DIR.name}/ is gitignored, so this transcript can end up "
+          f"in a commit. Use a bare name to write it to {OUTPUT_DIR.name}/.",
+          file=sys.stderr)
+    return True
+
+
 def resolve_output(stem):
     """
     Transcripts are written to output/ unless a directory was named explicitly.
     Returns a stem — save_output appends .txt / .timestamped.txt / .srt.
     """
     p = output_stem(stem)
-    return p if len(p.parts) > 1 or p.is_absolute() else OUTPUT_DIR / p.name
+    if len(p.parts) > 1 or p.is_absolute():
+        warn_if_committable(p)
+        return p
+    return OUTPUT_DIR / p.name
 
 
 def default_output(audio_path):
@@ -138,12 +172,23 @@ def default_output(audio_path):
 
 # ── Audio helpers ──────────────────────────────────────────────────────────────
 
+# A file's length cannot change while it is being transcribed, and the window
+# path asks for it once per decode attempt. One ffprobe per path is enough.
+_DURATION_CACHE = {}
+
+
 def get_duration(audio_path):
-    r = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(audio_path)],
-        capture_output=True, text=True, check=True,
-    )
-    return float(json.loads(r.stdout)["format"]["duration"])
+    key = str(audio_path)
+    if key not in _DURATION_CACHE:
+        r = subprocess.run(
+            # -i, not a bare trailing path: a filename starting with '-' is
+            # otherwise parsed by ffprobe as an option.
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format",
+             "-i", key],
+            capture_output=True, text=True, check=True,
+        )
+        _DURATION_CACHE[key] = float(json.loads(r.stdout)["format"]["duration"])
+    return _DURATION_CACHE[key]
 
 
 def silence_ends(audio_path, start=None, dur=None):
@@ -183,19 +228,34 @@ def chunk_boundaries(start, end, chunk_secs, silences, tolerance=None,
     to a hard cut when there is none nearby. Returns the boundaries including
     both ends, so [a, b, c] means two chunks.
     """
+    if chunk_secs < MIN_CHUNK_SECS:
+        # Zero or negative never terminates: the tolerance collapses, no silence
+        # is ever near, and each pass sets the next target to the split it just
+        # made, so the list grows until memory runs out.
+        raise ValueError(
+            f"chunk_secs must be at least {MIN_CHUNK_SECS}s, got {chunk_secs}"
+        )
     if tolerance is None:
         tolerance = chunk_tolerance(chunk_secs)
     splits = [start]
     target = start + chunk_secs
     while target < end - chunk_secs * 0.2:  # avoid a tiny tail chunk
+        # A silence at the very end is not a cut. Recordings that fade out end
+        # with one, and snapping to it appends `end` twice — a final chunk of
+        # no audio at all, extracted as a header-only WAV and handed to Whisper.
         nearby = [t for t in silences
-                  if t > splits[-1] and abs(t - target) < tolerance]
+                  if splits[-1] < t < end - MIN_CHUNK_SECS
+                  and abs(t - target) < tolerance]
         best = min(nearby, key=lambda t: abs(t - target)) if nearby else target
         splits.append(best)
         target = best + chunk_secs
         if verbose:
             print(f"chunk boundary at {best/60:.1f} min "
                   f"(next target {target/60:.1f} min)")
+    # Belt and braces for the hard-cut path: a last cut that leaves only a
+    # sliver folds back into the chunk before it rather than becoming its own.
+    if len(splits) > 1 and end - splits[-1] < MIN_CHUNK_SECS:
+        splits.pop()
     splits.append(end)
     return splits
 
@@ -240,9 +300,13 @@ def parse_window(s):
 def extract_chunk(audio_path, start, dur, out_path):
     """Extract a segment and convert to 16 kHz mono WAV (Whisper's native format)."""
     subprocess.run(
+        # -ss/-t go before -i: an input seek jumps straight to the chunk, while
+        # the same flags after -i make ffmpeg decode the whole file up to that
+        # point and throw it away — seconds per extraction, an hour in, and
+        # every repair window pays it again.
         ["ffmpeg", "-y", "-loglevel", "error",
-         "-i", str(audio_path),
          "-ss", str(start), "-t", str(dur),
+         "-i", str(audio_path),
          "-ar", "16000", "-ac", "1",
          str(out_path)],
         check=True,
@@ -250,6 +314,13 @@ def extract_chunk(audio_path, start, dur, out_path):
 
 
 # ── Transcription backends ─────────────────────────────────────────────────────
+
+# whisper.load_model reads a multi-hundred-MB checkpoint off disk, so the loaded
+# model is kept for the life of the process. One cache, shared by the whole-file
+# path and the window path: a repair decodes slice after slice, and handing each
+# one a fresh dict would reload the model for every slice of every attempt.
+_OPENAI_CACHE = {}
+
 
 def _transcribe_one_mlx(audio_path, model_name, language, condition_on_prev=True):
     import mlx_whisper
@@ -395,7 +466,6 @@ def transcribe(audio_path, backend, model_name, language, chunk_mins):
         splits = find_split_points(audio_path, chunk_secs, duration)
         print(f"Split into {len(splits)-1} chunks\n")
 
-    openai_cache = {}
     all_segments = []
     all_text = []
 
@@ -409,7 +479,7 @@ def transcribe(audio_path, backend, model_name, language, chunk_mins):
             extract_chunk(audio_path, start, end - start, chunk_path)
 
             t0 = time.time()
-            result = _run_backend(chunk_path, backend, model_name, language, openai_cache)
+            result = _run_backend(chunk_path, backend, model_name, language, _OPENAI_CACHE)
 
             elapsed = time.time() - t0
             shifted = [dict(seg, start=seg["start"] + start, end=seg["end"] + start)
@@ -440,7 +510,8 @@ TS_LINE = re.compile(
 def load_timestamped(path):
     """Read a .timestamped.txt back into segment dicts."""
     segments = []
-    for lineno, line in enumerate(Path(path).read_text().splitlines(), 1):
+    text = Path(path).read_text(encoding="utf-8")
+    for lineno, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
         m = TS_LINE.match(line)
@@ -532,7 +603,8 @@ def _decode_span(audio_path, span, duration, backend, model_name, language,
         extract_chunk(audio_path, dec_start, dec_end - dec_start, wav)
 
         t0 = time.time()
-        result = _run_backend(wav, backend, model_name, language, {}, condition_on_prev)
+        result = _run_backend(wav, backend, model_name, language, _OPENAI_CACHE,
+                              condition_on_prev)
         print(f"  decoded in {time.time() - t0:.0f}s")
 
     return [{"start": seg["start"] + dec_start, "end": seg["end"] + dec_start,
@@ -612,11 +684,27 @@ def splice(segments, window, replacement):
     def hits(s):
         return s["end"] > start and s["start"] < end
 
-    removed = [s for s in segments if hits(s)]
-    kept = [s for s in segments if not hits(s)]
-    first = next((i for i, s in enumerate(segments) if hits(s)), len(segments))
-    insert_at = sum(1 for s in segments[:first] if not hits(s))
+    removed, kept, insert_at = [], [], None
+    for seg in segments:
+        if hits(seg):
+            removed.append(seg)
+            # Every segment before the first overlap is a keeper, so the number
+            # of keepers so far is exactly where the new material belongs.
+            if insert_at is None:
+                insert_at = len(kept)
+        else:
+            kept.append(seg)
+
     ordered = sorted(replacement, key=lambda s: (s["start"], s["end"]))
+    if insert_at is None:
+        # Nothing overlapped, which is what a gap window looks like — there is
+        # no old segment for the new one to take the place of. Position it by
+        # the clock instead. Appending would leave the transcript out of order,
+        # and the next diagnose pass reads that as a rewind and re-decodes a
+        # window that was never wrong.
+        at = ordered[0]["start"] if ordered else start
+        insert_at = next((i for i, s in enumerate(kept) if s["start"] > at),
+                         len(kept))
     return kept[:insert_at] + ordered + kept[insert_at:], removed
 
 
@@ -628,15 +716,24 @@ def backup_file(path):
     """Copy path to path + '.bak' before it is overwritten in place."""
     src = Path(path)
     dest = src.with_suffix(src.suffix + ".bak")
-    dest.write_text(src.read_text())
+    # Explicitly UTF-8 both ways. This round-trips the transcript through a
+    # decode and an encode, so under a locale that is not UTF-8 it would mangle
+    # the very copy that exists to undo an in-place repair.
+    dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     return dest
 
 
 # ── Output ─────────────────────────────────────────────────────────────────────
 
 def fmt_time(t):
-    h, m, s = int(t // 3600), int((t % 3600) // 60), t % 60
-    return f"{h:02d}:{m:02d}:{s:05.2f}"
+    # Truncated, not rounded, exactly as fmt_srt_time is: rounding 59.999 up
+    # gives "00:00:60.00", a stamp that reads a whole minute early and does not
+    # round-trip through load_timestamped as the same time. The epsilon keeps
+    # binary float noise (0.29 held as 0.28999…) from truncating a real
+    # hundredth away.
+    h, m = int(t // 3600), int((t % 3600) // 60)
+    cs = int((t - h * 3600 - m * 60) * 100 + 1e-6)
+    return f"{h:02d}:{m:02d}:{cs // 100:02d}.{cs % 100:02d}"
 
 
 def fmt_srt_time(t):
@@ -659,20 +756,22 @@ def save_output(result, output_path, timestamps):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Whisper output routinely contains non-ASCII; the encoding is pinned rather
+    # than left to whatever locale the run happens to have.
     txt_path = Path(str(output_path) + ".txt")
-    with open(txt_path, "w") as f:
+    with open(txt_path, "w", encoding="utf-8") as f:
         f.write(result["text"].strip())
     print(f"\nSaved: {txt_path}")
 
     if timestamps and result.get("segments"):
         ts_path = Path(str(output_path) + ".timestamped.txt")
-        with open(ts_path, "w") as f:
+        with open(ts_path, "w", encoding="utf-8") as f:
             for seg in result["segments"]:
                 f.write(f"[{fmt_time(seg['start'])} --> {fmt_time(seg['end'])}]  {seg['text'].strip()}\n")
         print(f"Saved: {ts_path}")
 
         srt_path = Path(str(output_path) + ".srt")
-        with open(srt_path, "w") as f:
+        with open(srt_path, "w", encoding="utf-8") as f:
             for i, seg in enumerate(result["segments"], 1):
                 f.write(f"{i}\n{fmt_srt_time(seg['start'])} --> {fmt_srt_time(seg['end'])}\n{seg['text'].strip()}\n\n")
         print(f"Saved: {srt_path}")
@@ -680,9 +779,120 @@ def save_output(result, output_path, timestamps):
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
-def main():
-    # Convert SIGTERM into SystemExit so the tempfile context manager cleans up
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+# The retry model when a window still loops after the first attempt. Stated
+# here and in --help rather than left to repair.py's dataclass default, where a
+# `--model tiny` draft run would silently fetch a multi-GB checkpoint.
+DEFAULT_FALLBACK_MODEL = "large-v3"
+
+
+def chunk_minutes(value):
+    """
+    argparse type for --chunk-size. Zero or negative never reaches chunking's
+    guard — it hangs allocating boundaries — so it is refused at the CLI, where
+    the user can still be told what was wrong with what they typed.
+    """
+    try:
+        minutes = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"chunk size must be a whole number of minutes, got {value!r}")
+    if minutes < 1:
+        raise argparse.ArgumentTypeError(
+            f"chunk size must be at least 1 minute, got {minutes}")
+    return minutes
+
+
+def repair_kwargs(args, backend, repair):
+    """
+    The RepairOptions this run's flags imply, as plain kwargs. `repair` is the
+    module, passed in rather than imported, so which flag lands on which option
+    is checkable on its own — and so this file keeps its deferred import (repair
+    imports this module).
+    """
+    return dict(
+        backend=backend,
+        model=args.repair_model or args.model,
+        # Passed explicitly: left unset it takes repair's own default, so a
+        # small --model could still pull down the largest checkpoint there is.
+        fallback_model=args.fallback_model,
+        language=args.language,
+        # Repair windows are sliced the same way this run's chunks were, so
+        # the pass that cleans up a loop cannot re-create one by decoding a
+        # longer stretch than the transcription itself was allowed.
+        chunk_mins=args.chunk_size,
+        # Repetitions only unless asked otherwise: those are the windows
+        # this run demonstrably got wrong, and re-decoding them is minutes
+        # of work rather than a second pass over most of the recording.
+        targets=(repair.REPAIRABLE_KINDS if args.include_gaps
+                 else repair.REPETITION_KINDS),
+        passes=args.repair_passes,
+        strict=args.strict,
+        # Which gaps the audio says a decode could recover, read off this run's
+        # flags by repair's own reader. Assembled there rather than here so the
+        # three thresholds mean the same thing whether they arrived through
+        # this CLI or repair.py's.
+        gate=repair.gate_from_args(args),
+    )
+
+
+# The gap-dynamics thresholds the repair pass gates its decodes on. Named here
+# only so this file can ask repair.py for those three flags by name; the
+# numbers, the help text and the validation all stay over there. They sit
+# within tenths of a dB of real measurements, which is exactly the kind of
+# constant a second copy of gets edited on one side and not the other.
+GATE_FLAGS = ("--ambient-peak-db", "--ambient-spread-db", "--off-mic-peak-db")
+
+
+class FlagRecorder:
+    """
+    Stands in for an argparse parser long enough to record what would have been
+    added to one. add_common's whole contract is that it calls .add_argument,
+    so this needs nothing else — and asking repair.py for its flags this way
+    keeps both files off argparse's internals.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def add_argument(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+
+def add_gate_flags(group, repair):
+    """
+    Lift repair.py's three dynamics thresholds onto this parser verbatim — same
+    names, same defaults, same help. `repair` is the module, passed in for the
+    same reason it is passed to repair_kwargs.
+
+    Lifted rather than restated so that --help here promises exactly what the
+    repair pass will do and moving a threshold stays one edit in one file. Only
+    these three: the rest of add_common is repair.py's own surface, and
+    --include-gaps already exists on this parser under the same name.
+    """
+    recorder = FlagRecorder()
+    repair.add_common(recorder)
+    lifted = [(a, kw) for a, kw in recorder.calls if a and a[0] in GATE_FLAGS]
+    missing = set(GATE_FLAGS) - {a[0] for a, _ in lifted}
+    if missing:
+        # Loudly, rather than quietly dropping a flag the user is told exists:
+        # a silently absent threshold is one that cannot be moved on this path,
+        # which is the whole reason it is here.
+        raise RuntimeError(
+            f"repair.py no longer offers {sorted(missing)} — the automatic "
+            f"repair pass and repair.py's CLI have to gate on the same flags")
+    for a, kw in lifted:
+        group.add_argument(*a, **kw)
+
+
+def build_parser(repair=None):
+    """
+    `repair` is the module, supplying the gate thresholds' defaults and help
+    text. Passed in where the caller already has it, imported on demand where
+    it does not, because this file cannot import it at the top: repair.py
+    imports this one.
+    """
+    if repair is None:
+        import repair
 
     parser = argparse.ArgumentParser(
         description="Transcribe audio with Whisper (chunked to prevent repetition bugs)",
@@ -720,7 +930,7 @@ repair.py to run that cycle against a transcript you already have.
     )
     parser.add_argument(
         "--chunk-size", "-c",
-        type=int,
+        type=chunk_minutes,
         default=DEFAULT_CHUNK_MINS,
         metavar="MINUTES",
         help=f"Max chunk length in minutes; splits at silence "
@@ -739,9 +949,16 @@ repair.py to run that cycle against a transcript you already have.
     )
     parser.add_argument(
         "--timestamps", "-t",
+        dest="timestamps",
         action="store_true",
         default=True,
         help="Also save timestamped .txt and .srt files (default: on)",
+    )
+    parser.add_argument(
+        "--no-timestamps",
+        dest="timestamps",
+        action="store_false",
+        help="Write only the plain .txt, no .timestamped.txt and no .srt",
     )
 
     rep = parser.add_argument_group("automatic repair (runs after transcription)")
@@ -756,6 +973,14 @@ repair.py to run that cycle against a transcript you already have.
         default=None,
         choices=MODELS,
         help="Model used to re-transcribe defective windows (default: same as --model)",
+    )
+    rep.add_argument(
+        "--fallback-model",
+        default=DEFAULT_FALLBACK_MODEL,
+        choices=MODELS,
+        help=f"Model a window is retried with when the first pass still loops "
+             f"(default: {DEFAULT_FALLBACK_MODEL} — a large checkpoint, and "
+             f"fetched on first use even when --model is a small one)",
     )
     rep.add_argument(
         "--repair-passes",
@@ -775,8 +1000,28 @@ repair.py to run that cycle against a transcript you already have.
         help="Also re-decode gaps. Off by default: only repetitions (loops, "
              "stutters, boilerplate) are repaired, gaps are reported",
     )
+    add_gate_flags(rep, repair)
 
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    # Convert SIGTERM into SystemExit so the tempfile context manager cleans up
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+
+    import repair  # deferred: repair imports this module
+
+    args = build_parser(repair).parse_args()
+
+    # Before the recording is even looked for, let alone decoded: an incoherent
+    # gate is a transcription that runs for hours and then declines to repair
+    # anything, or repairs the wrong things. repair.py's own checker, so both
+    # entry points refuse the same combinations for the same stated reasons.
+    # min_run and min_gap are not flags here, so they are whatever the repair
+    # options default to — which is what this run will actually use.
+    repair_defaults = repair.RepairOptions()
+    repair.check_settings(repair_defaults.min_run, repair_defaults.min_gap,
+                          args.repair_passes, repair.gate_from_args(args))
 
     audio_path = resolve_input(args.audio)
     if not audio_path.exists():
@@ -801,24 +1046,7 @@ repair.py to run that cycle against a transcript you already have.
     save_output(result, output_path, args.timestamps)
 
     if args.repair:
-        import repair  # deferred: repair imports this module
-
-        opts = repair.RepairOptions(
-            backend=backend,
-            model=args.repair_model or args.model,
-            language=args.language,
-            # Repair windows are sliced the same way this run's chunks were, so
-            # the pass that cleans up a loop cannot re-create one by decoding a
-            # longer stretch than the transcription itself was allowed.
-            chunk_mins=args.chunk_size,
-            # Repetitions only unless asked otherwise: those are the windows
-            # this run demonstrably got wrong, and re-decoding them is minutes
-            # of work rather than a second pass over most of the recording.
-            targets=(repair.REPAIRABLE_KINDS if args.include_gaps
-                     else repair.REPETITION_KINDS),
-            passes=args.repair_passes,
-            strict=args.strict,
-        )
+        opts = repair.RepairOptions(**repair_kwargs(args, backend, repair))
         segments, report, _ = repair.diagnose_repair_verify(
             audio_path, result["segments"], opts, title="Automatic repair pass"
         )
