@@ -13,6 +13,11 @@ Both are invisible in the .txt output — you only see them by looking at the
 timestamps. This finds them, re-transcribes just the affected windows, splices
 the result back in, and then re-runs the check to report what is left.
 
+Only the repetitions are re-decoded by default. A loop or a stutter is text we
+know is wrong and a window a minute long; gaps are far more numerous and are
+mostly pauses the audio check could not rule out, so decoding them turns a
+targeted fix into a re-run of most of the recording. --include-gaps opts in.
+
   ./repair.py diagnose beach.m4a beach.timestamped.txt
   ./repair.py repair   beach.m4a beach.timestamped.txt
   ./repair.py repair   beach.m4a beach.timestamped.txt -w 20:47-21:09
@@ -27,6 +32,15 @@ which windows get re-decoded.
 
 Gaps are classified by measuring the audio underneath them: a gap over silence
 is correct behaviour and is left alone, a gap over speech is lost content.
+
+A third failure needs no decoding at all. Whisper does not stop where its audio
+does, so a chunk ending mid-loop keeps emitting past its seam and that tail
+merges in after the next chunk's opening — timestamps running backwards. The
+tail is text invented past the end of the chunk's own audio, so deleting it is
+the entire repair. It runs first, before any window is chosen — a hallucinated
+tail that is already gone needs no decode to remove it, and deleting it later
+would mean walking back across text a repair had just spliced in. Nothing is
+deleted until the recording confirms the seam is a real chunk boundary.
 """
 
 import argparse
@@ -38,6 +52,18 @@ from pathlib import Path
 from typing import Optional
 
 import transcribe as T
+
+
+# Whisper repeating itself: a stretch it demonstrably got wrong, and short.
+REPETITION_KINDS = ("loop", "stutter", "canned")
+# Every kind a decode could in principle address. Gaps are here but not in
+# REPETITION_KINDS: a gap is speech we may be missing rather than text we know
+# is wrong, and on a real recording they outnumber the repetitions several to
+# one, so repairing them by default turns a targeted fix into a broad re-run.
+REPAIRABLE_KINDS = REPETITION_KINDS + ("gap",)
+# A rewind is repaired by deleting what a chunk decoded past its seam, not by
+# decoding anything, so it never joins the kinds above and never costs a window.
+SEAM_TRIMMED = "seam overrun trimmed"
 
 
 @dataclass
@@ -52,6 +78,11 @@ class RepairOptions:
     # way a whole file is — one long decode is what makes Whisper loop, and a
     # repair window is by definition somewhere it already has.
     chunk_mins: int = T.DEFAULT_CHUNK_MINS
+    # Which defects earn a re-decode. Repetitions only, by default: those are
+    # the windows where Whisper overwrote real speech with the same line over
+    # and over, and the fix is worth the decode. Gaps are reported either way
+    # and joined in with --include-gaps.
+    targets: tuple = REPETITION_KINDS
     join_within: float = 5.0
     strict: bool = False
     passes: int = 2
@@ -75,7 +106,8 @@ class Defect:
 
     @property
     def repairable(self):
-        return self.kind in ("loop", "gap", "stutter", "canned")
+        """Could be re-decoded. Whether it *is* depends on RepairOptions.targets."""
+        return self.kind in REPAIRABLE_KINDS
 
     def __repr__(self):
         return (f"[{self.kind}] {T.fmt_time(self.start)}–{T.fmt_time(self.end)} "
@@ -238,9 +270,15 @@ def repair_window(audio_path, window, opts):
     return best, best_problems
 
 
-def defect_windows(defects, join_within=5.0):
-    """The decode windows that cover every repairable defect."""
-    targets = [d for d in defects if d.repairable]
+def defect_windows(defects, join_within=5.0, kinds=REPETITION_KINDS):
+    """
+    The decode windows that cover the defects worth re-transcribing.
+
+    `kinds` is the whole point of the repair pass being cheap: only the
+    stretches Whisper actually got wrong are handed back to it, so the decode
+    is a few minutes of a recording rather than the recording.
+    """
+    targets = [d for d in defects if d.kind in kinds]
     return merge_windows([(d.start, d.end) for d in targets], join_within)
 
 
@@ -297,6 +335,41 @@ def repair(audio_path, segments, windows, opts, dry_run=False):
     return segments, report
 
 
+def seam_confirmer(audio_path):
+    """
+    A chunk boundary is cut at the end of a silence, so a real seam has one
+    underneath it. Only two seconds either side get scanned — the transcript
+    already says where to look, and this runs once per rewind.
+    """
+    def confirm(seam):
+        near = T.silence_ends(audio_path, max(0.0, seam - 2.0), 4.0)
+        return any(abs(s - seam) <= 0.25 for s in near)
+    return confirm
+
+
+def trim_seams(audio_path, segments, opts, dry_run=False):
+    """
+    Delete what each chunk decoded past its seam. Returns (segments, trims).
+
+    This needs the audio. Confirming the seam is a real chunk boundary is what
+    keeps the trim from deleting speech out of a transcript whose timestamps
+    are merely disordered — the one case where the text after the seam is the
+    invention and the text before it is what was actually said. Without audio
+    nothing is trimmed and it says so.
+    """
+    found = T.seam_overruns(segments)
+    if not found:
+        return segments, []
+    if not (audio_path and opts.check_audio):
+        print(f"\n{len(found)} seam overrun(s) left alone — trimming them needs "
+              f"the audio, to confirm each seam is a chunk boundary.")
+        return segments, []
+
+    trimmed, trims = T.trim_seam_overruns(segments, seam_confirmer(audio_path))
+    print_trims(trims, len(found), dry_run)
+    return (segments if dry_run else trimmed), trims
+
+
 def diagnose_repair_verify(audio_path, segments, opts, windows=None,
                            dry_run=False, title="Repair"):
     """
@@ -311,12 +384,26 @@ def diagnose_repair_verify(audio_path, segments, opts, windows=None,
         return diagnose(segs, audio_path, opts.min_run, opts.min_gap, opts.check_audio)
 
     print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
-    defects = scan(segments)
-    print_diagnosis(defects, segments)
+    print(f"Targeting: {', '.join(opts.targets)}")
 
-    report = []
+    # First, and deliberately. Trimming costs no decoding, and doing it before
+    # anything is spliced is what keeps it safe: the walk back from a backwards
+    # jump takes everything between it and the seam, which is the overrunning
+    # tail *until* a repair has put freshly decoded text in that stretch — then
+    # it is the repair's own output. Ordering the two is the whole fix. It also
+    # makes the decode smaller, since a hallucinated tail no longer has to be
+    # diagnosed and re-transcribed to get rid of it.
+    segments, trims = trim_seams(audio_path, segments, opts, dry_run)
+    report = [((seam, tail[-1]["end"]), SEAM_TRIMMED, not dry_run,
+               sum(len(s["text"].split()) for s in tail), 0)
+              for seam, tail in trims]
+
+    defects = scan(segments)
+    print_diagnosis(defects, segments, opts.targets)
+
     for p in range(1, opts.passes + 1):
-        todo = list(windows) if windows else defect_windows(defects, opts.join_within)
+        todo = (list(windows) if windows else
+                defect_windows(defects, opts.join_within, opts.targets))
         if not todo:
             print(f"\nPass {p}: nothing left to repair.")
             break
@@ -332,17 +419,25 @@ def diagnose_repair_verify(audio_path, segments, opts, windows=None,
     if not dry_run:
         print("\nFinal check:")
         defects = scan(segments)
-        print_diagnosis(defects, segments)
-        remaining = [d for d in defects if d.repairable]
-        print("\n✓ transcript is clean — no loops or unexplained gaps left."
+        print_diagnosis(defects, segments, opts.targets)
+        # Only what was aimed at counts against the verdict. A gap left behind
+        # by a repetition-only run was never going to be decoded, so calling it
+        # unresolved would fail every clean transcript.
+        remaining = [d for d in defects if d.kind in opts.targets]
+        untargeted = [d for d in defects
+                      if d.repairable and d.kind not in opts.targets]
+        print(f"\n✓ transcript is clean — no {'/'.join(opts.targets)} left."
               if not remaining else
               f"\n⚠ {len(remaining)} defect(s) still unresolved (listed above).")
+        if untargeted:
+            print(f"  {len(untargeted)} untargeted defect(s) reported but not "
+                  f"repaired — re-run with --include-gaps to decode them too.")
     return segments, report, defects
 
 
 # ── Reporting ──────────────────────────────────────────────────────────────────
 
-def print_diagnosis(defects, segments):
+def print_diagnosis(defects, segments, targets=REPETITION_KINDS):
     kinds = {}
     for d in defects:
         kinds.setdefault(d.kind, []).append(d)
@@ -354,25 +449,53 @@ def print_diagnosis(defects, segments):
         if not found:
             continue
         total = sum(d.end - d.start for d in found)
-        print(f"\n{kind.upper()}  ({len(found)}, {total:.0f}s total)")
+        # A rewind reaching the diagnosis is one the trim already declined: no
+        # recording to check, or nothing under the seam to confirm it. Decoding
+        # was never the fix for it either way.
+        note = ("  — merge artefact, only trimmed where the recording confirms "
+                "the seam" if kind == "rewind"
+                else "" if kind in targets else "  — reported, not repaired")
+        print(f"\n{kind.upper()}  ({len(found)}, {total:.0f}s total){note}")
         for d in found:
             print(f"  {T.fmt_time(d.start)}–{T.fmt_time(d.end)}  "
                   f"({d.end - d.start:5.1f}s)  {d.detail}")
 
-    repairable = [d for d in defects if d.repairable]
-    affected = sum(d.end - d.start for d in repairable)
+    targeted = [d for d in defects if d.kind in targets]
+    affected = sum(d.end - d.start for d in targeted)
     span = segments[-1]["end"] - segments[0]["start"] if segments else 0
     print(f"\n{len(segments)} segments over {span/60:.0f} min")
-    print(f"{len(repairable)} repairable defects affecting {affected:.0f}s "
+    print(f"{len(targeted)} targeted defects affecting {affected:.0f}s "
           f"({affected/span*100:.1f}% of the recording)" if span else "")
+
+
+def print_trims(trims, found, dry_run=False):
+    if not trims:
+        print(f"\nSeam overruns: none of the {found} candidate(s) sit on a chunk "
+              f"boundary — left alone.")
+        return
+    total = sum(len(tail) for _, tail in trims)
+    print(f"\nSEAM OVERRUNS — {'would drop' if dry_run else 'dropped'} {total} "
+          f"segment(s) at {len(trims)}/{found} seam(s), decoded past the end of "
+          f"their own chunk")
+    for seam, tail in trims:
+        print(f"  {T.fmt_time(seam)}  {len(tail)} segment(s), running "
+              f"{tail[-1]['end'] - seam:.0f}s past the seam")
+        for s in tail[:2]:
+            print(f"      [{T.fmt_time(s['start'])}] {s['text'][:60]}")
+        if len(tail) > 2:
+            print(f"      … and {len(tail) - 2} more")
 
 
 def print_report(report):
     if not report:
         return
     print("=" * 60)
-    ok = sum(1 for _, s, _, _, _ in report if s == "repaired")
-    print(f"REPAIR SUMMARY — {ok}/{len(report)} windows clean")
+    # Seam trims are counted apart: they cost no window and can't come back
+    # dirty, so folding them in would flatter the decode success rate.
+    decoded = [r for r in report if r[1] != SEAM_TRIMMED]
+    ok = sum(1 for _, s, _, _, _ in decoded if s == "repaired")
+    print(f"REPAIR SUMMARY — {ok}/{len(decoded)} windows clean"
+          if decoded else "REPAIR SUMMARY")
     for (a, b), status, _, old_w, new_w in report:
         print(f"  {T.fmt_time(a)}–{T.fmt_time(b)}  {status}  "
               f"({old_w} → {new_w} words)")
@@ -387,6 +510,12 @@ def add_common(p):
                    help="Untranscribed seconds before it counts as a gap (default: 5)")
     p.add_argument("--no-audio-check", dest="check_audio", action="store_false",
                    help="Skip measuring audio under gaps (faster, less accurate)")
+    # On diagnose/verify this decides the exit status, on repair which windows
+    # are decoded — deliberately the same flag, so the gate and the repairer
+    # never disagree about what counts as a defect worth acting on.
+    p.add_argument("--include-gaps", action="store_true",
+                   help="Also target gaps. Off by default: only repetitions "
+                        "(loops, stutters, boilerplate) are re-decoded")
 
 
 def main():
@@ -402,8 +531,9 @@ examples:
   %(prog)s verify   beach.repaired.timestamped.txt
 
 Audio is looked up in local/ and transcripts in output/, so bare names work.
-With no -w the windows come from the diagnosis; with -w only those stretches
-are re-decoded. Either way it is the same splice-and-recheck path.
+With no -w the windows come from the diagnosis — the repetitions it found,
+plus gaps if you pass --include-gaps; with -w only those stretches are
+re-decoded. Either way it is the same splice-and-recheck path.
         """,
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -458,20 +588,22 @@ are re-decoded. Either way it is the same splice-and-recheck path.
     if getattr(args, "audio", None):
         args.audio = T.resolve_input(args.audio)
     segments = T.load_timestamped(args.transcript)
+    targets = REPAIRABLE_KINDS if args.include_gaps else REPETITION_KINDS
 
     if args.cmd in ("verify", "diagnose"):
         # diagnose takes audio positionally, verify as an optional flag; both
         # land on args.audio and both gate the exit status on what they find.
         defects = diagnose(segments, args.audio, args.min_run, args.min_gap,
                            args.check_audio and bool(args.audio))
-        print_diagnosis(defects, segments)
-        sys.exit(1 if any(d.repairable for d in defects) else 0)
+        print_diagnosis(defects, segments, targets)
+        sys.exit(1 if any(d.kind in targets for d in defects) else 0)
 
     print(f"Loaded {len(segments)} segments from {args.transcript}")
     opts = RepairOptions(
         backend=T.resolve_backend(args.backend), model=args.model,
         fallback_model=args.fallback_model, language=args.language,
-        pad=args.pad, chunk_mins=args.chunk_size, join_within=args.join_within,
+        pad=args.pad, chunk_mins=args.chunk_size, targets=targets,
+        join_within=args.join_within,
         strict=args.strict, passes=args.passes, min_run=args.min_run,
         min_gap=args.min_gap, check_audio=args.check_audio,
     )

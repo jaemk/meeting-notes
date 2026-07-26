@@ -18,7 +18,12 @@ TRANSCRIPT ?= $(OUTPUT).timestamped.txt
 ARGS     ?= --model large-v2 -c 1 -l en
 FIX_ARGS ?= --model large-v2 -c 1 -l en
 
-.PHONY: all transcribe check fix test setup clean distclean
+CLAUDE ?= claude
+# The prompt is a file rather than a here-doc so it can be read, reviewed and
+# edited like anything else in the repo. @AUDIO@/@TRANSCRIPT@ are filled in.
+PROMPT ?= analyze.md
+
+.PHONY: all transcribe check fix analyze test setup clean distclean
 
 all: transcribe
 
@@ -30,20 +35,28 @@ define need_transcript
 @test -f "$(TRANSCRIPT)" || { echo "Error: no transcript at '$(TRANSCRIPT)' — pass INPUT=local/<audio> or TRANSCRIPT=<file>"; exit 1; }
 endef
 
+# GAPS=1 widens every target from "the repetitions Whisper produced" to "those
+# plus the stretches it produced nothing for". It means the same thing to all
+# three targets below, so the check keeps agreeing with the repair.
+GAPS_FLAG = $(if $(GAPS),--include-gaps,)
+
 # Transcribe, then automatically diagnose → repair → re-check.
 # Pass NO_REPAIR=1 to stop after the raw transcription.
 transcribe: $(STAMP)
 	$(need_input)
-	$(PYTHON) transcribe.py $(INPUT) --output $(OUTPUT) $(ARGS) \
+	$(PYTHON) transcribe.py $(INPUT) --output $(OUTPUT) $(ARGS) $(GAPS_FLAG) \
 		$(if $(NO_REPAIR),--no-repair,)
 
-# Report loops/gaps in an existing transcript. Exits nonzero if any remain.
+# Report loops (and with GAPS=1, gaps) in an existing transcript.
+# Exits nonzero if any remain.
 check: $(STAMP)
 	$(need_transcript)
-	$(PYTHON) repair.py verify $(TRANSCRIPT) $(if $(INPUT),--audio $(INPUT),)
+	$(PYTHON) repair.py verify $(TRANSCRIPT) $(if $(INPUT),--audio $(INPUT),) \
+		$(GAPS_FLAG)
 
 # Run the repair pass on its own, against an existing transcript.
-#   make fix                                  repair every defect it finds
+#   make fix                                  re-decode the repetitions it finds
+#   make fix GAPS=1                           re-decode dropped speech as well
 #   make fix WINDOWS="-w 20:47-21:09"         repair only these stretches
 #   make fix DRY=1                            preview, decode nothing
 #   make fix IN_PLACE=1                       overwrite $(TRANSCRIPT), keeps a .bak
@@ -51,7 +64,24 @@ fix: $(STAMP)
 	$(need_input)
 	$(need_transcript)
 	$(PYTHON) repair.py repair $(INPUT) $(TRANSCRIPT) $(FIX_ARGS) $(WINDOWS) \
-		$(if $(IN_PLACE),--in-place,) $(if $(DRY),--dry-run,)
+		$(GAPS_FLAG) $(if $(IN_PLACE),--in-place,) $(if $(DRY),--dry-run,)
+
+# Hand the transcript to Claude with the reasoning needed to review it: what the
+# chunked merge does to timestamps, which side of a seam is lying, and which
+# defects are worth a decode. `check` and `fix` apply the rules; this is for the
+# judgement calls they can't make — whether a gap is really dropped speech,
+# whether a repair came back worse, what to do about it.
+#
+#   make analyze                       interactive session, seeded with the prompt
+#   make analyze PRINT=1               one-shot, prints its findings and exits
+#   make analyze PROMPT=<file>         ask something else entirely
+analyze: $(STAMP)
+	$(need_input)
+	$(need_transcript)
+	@test -f "$(PROMPT)" || { echo "Error: no prompt at '$(PROMPT)'"; exit 1; }
+	@command -v $(CLAUDE) >/dev/null || { echo "Error: '$(CLAUDE)' not on PATH — see https://claude.com/claude-code"; exit 1; }
+	$(CLAUDE) $(if $(PRINT),-p,) "$$(sed -e 's|@AUDIO@|$(INPUT)|g' \
+		-e 's|@TRANSCRIPT@|$(TRANSCRIPT)|g' $(PROMPT))"
 
 test: $(STAMP)
 	$(PYTHON) test_transcribe.py

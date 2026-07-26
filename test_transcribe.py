@@ -272,9 +272,85 @@ res = T.transcribe("fake.m4a", "mlx", "medium", "en", 5)
 check("two chunks decoded", len(chunks) == 2, chunks)
 check("segment offsets applied", [s["start"] for s in res["segments"]] == [0.0, 300.0],
       [s["start"] for s in res["segments"]])
-check("text joined", res["text"] == "chunk text chunk text", res["text"])
+check("text is rebuilt from the segments that survived the merge",
+      res["text"] == "hello hello", res["text"])
 T.get_duration = lambda p: 100.0
 res2 = T.transcribe("fake.m4a", "mlx", "medium", "en", 5)
 check("short file not split", len(res2["segments"]) == 1, res2["segments"])
+
+check.section("a chunk overrunning its seam cannot reorder the transcript")
+# Whisper does not stop where its audio does. A chunk ending mid-loop keeps
+# emitting the same line with timestamps running past the end; merged as-is
+# they sort after the next chunk's opening and time appears to run backwards.
+calls = []
+def looping_backend(path, backend, model, lang, cache, cond=True):
+    calls.append(path)
+    if len(calls) == 1:                     # chunk [0, 300), still looping at 300
+        return {"text": "ignored", "segments": [
+            {"start": 280.0, "end": 295.0, "text": "real speech"},
+            {"start": 295.0, "end": 302.0, "text": "straddles the seam"},
+            {"start": 302.0, "end": 327.0, "text": "loop tail"},
+        ]}
+    return {"text": "ignored",
+            "segments": [{"start": 0.0, "end": 5.0, "text": "next chunk opening"}]}
+T._run_backend = looping_backend
+T.get_duration = lambda p: 600.0
+res3 = T.transcribe("fake.m4a", "mlx", "medium", "en", 5)
+texts = [s["text"] for s in res3["segments"]]
+starts = [s["start"] for s in res3["segments"]]
+check("the tail decoded past the chunk end is dropped", "loop tail" not in texts, texts)
+check("so the merged timestamps never go backwards", starts == sorted(starts), starts)
+check("a segment straddling the seam is clamped, not dropped — with no padding "
+      "between chunks its opening words exist nowhere else",
+      [(s["start"], s["end"]) for s in res3["segments"]
+       if s["text"] == "straddles the seam"] == [(295.0, 300.0)], res3["segments"])
+check("the .txt loses the hallucinated tail too",
+      res3["text"] == "real speech straddles the seam next chunk opening", res3["text"])
+
+check.section("clamp_to_chunk")
+raw = [{"start": 10.0, "end": 20.0, "text": "inside"},
+       {"start": 55.0, "end": 70.0, "text": "straddles"},
+       {"start": 60.0, "end": 90.0, "text": "starts past the end"},
+       {"start": 61.0, "end": 61.0, "text": "empty and past the end"}]
+kept = T.clamp_to_chunk(raw, 0.0, 60.0)
+check("segments starting at or after the chunk end are dropped",
+      [s["text"] for s in kept] == ["inside", "straddles"], [s["text"] for s in kept])
+check("a straddler keeps its text and ends at the seam",
+      (kept[1]["start"], kept[1]["end"]) == (55.0, 60.0), kept[1])
+check("a segment wholly inside is untouched", kept[0] == raw[0], kept[0])
+check("the input is copied, not mutated", raw[1]["end"] == 70.0, raw[1])
+check("clamping is a no-op when nothing overruns",
+      T.clamp_to_chunk(raw[:1], 0.0, 60.0) == raw[:1])
+
+check.section("trimming a seam overrun back out of a transcript already written")
+merged = [
+    {"start": 280.0, "end": 295.0, "text": "real speech"},
+    {"start": 295.0, "end": 302.0, "text": "straddles the seam"},
+    {"start": 302.0, "end": 327.0, "text": "loop tail"},
+    {"start": 300.0, "end": 305.0, "text": "next chunk opening"},
+    {"start": 305.0, "end": 310.0, "text": "and on it goes"},
+]
+check("the overrun is located and the seam with it",
+      T.seam_overruns(merged) == [(2, 3, 300.0)], T.seam_overruns(merged))
+out, trims = T.trim_seam_overruns(merged)
+check("what the chunk decoded past its seam is dropped",
+      [s["text"] for s in out] == ["real speech", "straddles the seam",
+                                   "next chunk opening", "and on it goes"],
+      [s["text"] for s in out])
+check("the straddler keeps its words and ends at the seam",
+      (out[1]["start"], out[1]["end"]) == (295.0, 300.0), out[1])
+check("so time runs forwards afterwards", T.seam_overruns(out) == [], T.seam_overruns(out))
+check("the trim names exactly what it removed", trims == [(300.0, [merged[2]])], trims)
+check("the transcript passed in is not mutated",
+      len(merged) == 5 and merged[1]["end"] == 302.0, merged[1])
+check("a rejected seam is left alone — confirm() has the last word",
+      T.trim_seam_overruns(merged, lambda seam: False) == (merged, []))
+# The tail is audio the chunk never had, so how much the next chunk found to say
+# for that stretch is beside the point — a quiet minute after the seam does not
+# make an invented tail worth keeping.
+orphan = merged[:3] + [{"start": 300.0, "end": 301.0, "text": "only a second of it"}]
+check("a sparse next chunk does not save the tail",
+      T.trim_seam_overruns(orphan)[1] == [(300.0, [merged[2]])],
+      T.trim_seam_overruns(orphan)[1])
 
 check.finish()

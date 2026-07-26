@@ -15,10 +15,13 @@ gitignored). A recording's name carries over to its transcript, so
 local/2026-07-25.m4a becomes output/2026-07-25.txt and friends.
 
 Long files are automatically split at silence boundaries to prevent
-Whisper's hallucination/repetition bug on extended audio. Whatever slips
-through anyway is found and re-transcribed by the repair pass that runs
-automatically at the end (--no-repair to skip it); see repair.py to run
-that diagnose/repair/verify cycle against an existing transcript.
+Whisper's hallucination/repetition bug on extended audio. Each chunk's
+segments are held inside the audio that chunk covered — Whisper does not
+stop where its audio does, and a tail that runs past the seam lands after
+the next chunk's opening line. Whatever slips through anyway is found and
+re-transcribed by the repair pass that runs automatically at the end
+(--no-repair to skip it); see repair.py to run that diagnose/repair/verify
+cycle against an existing transcript.
 """
 
 import argparse
@@ -288,6 +291,95 @@ def _run_backend(audio_path, backend, model_name, language, cache, condition_on_
     return _transcribe_one_openai(audio_path, model_name, language, cache, condition_on_prev)
 
 
+def clamp_to_chunk(segments, start, end):
+    """
+    Hold a chunk's segments inside the audio that chunk actually covered.
+
+    Whisper does not stop where its audio does. A chunk that ends mid-loop keeps
+    emitting the same line with timestamps running past the end — 27 seconds
+    past, on the recording this was written for. Chunks tile the file exactly,
+    so anything beyond `end` is either the next chunk's speech, which is about
+    to be decoded properly, or invented. Left alone it lands after the next
+    chunk's opening line and the transcript's timestamps go backwards.
+
+    A segment merely straddling the seam is clamped, not dropped: with no
+    padding between chunks, the words before the seam exist in no other chunk.
+    That is the difference from transcribe_window, which can drop a straddler
+    because its neighbouring slice was decoded with the overlap.
+    """
+    kept = []
+    for seg in segments:
+        if seg["start"] >= end:
+            continue
+        seg = dict(seg)
+        seg["end"] = min(seg["end"], end)
+        if seg["end"] > seg["start"]:
+            kept.append(seg)
+    return kept
+
+
+def seam_overruns(segments, tolerance=0.01):
+    """
+    Where a chunk's tail was merged past its seam. Each entry is (a, b, seam):
+    segments[a:b] are the overrunning ones and `seam` is where the next chunk
+    picks the file back up.
+
+    Which side is which is not a guess. Chunk timestamps are offset by the
+    chunk's own start, so a chunk's first segment can never predate its seam —
+    when time runs backwards in a merged transcript it is the chunk before
+    overrunning, never the chunk after starting early.
+    """
+    out = []
+    for i in range(1, len(segments)):
+        seam = segments[i]["start"]
+        if seam >= segments[i - 1]["start"] - tolerance:
+            continue
+        j = i - 1
+        while j >= 0 and segments[j]["start"] >= seam:
+            j -= 1
+        out.append((j + 1, i, seam))
+    return out
+
+
+def trim_seam_overruns(segments, confirm=None):
+    """
+    The retroactive twin of clamp_to_chunk, for a transcript already written.
+
+    Drops what a chunk decoded past its seam and clamps whatever straddles it,
+    leaving exactly what clamping during the merge would have. `confirm(seam)`
+    vets each one — repair.py passes a check that the seam really is a chunk
+    boundary, so a stretch of merely out-of-order timestamps is left alone.
+
+    Returns (segments, trims) with a trim being (seam, dropped_segments).
+    """
+    drop, clamp_at, trims = set(), {}, []
+    for a, b, seam in seam_overruns(segments):
+        tail = segments[a:b]
+        # Nothing is lost that was ever heard: a chunk's audio stops at its seam,
+        # so a segment starting past it is invented, whether or not the next
+        # chunk had much to say for that stretch. Confirming the seam is a real
+        # boundary is the whole safeguard, which is why confirm() comes first.
+        if confirm and not confirm(seam):
+            continue
+        drop.update(range(a, b))
+        if a:
+            clamp_at[a - 1] = seam
+        trims.append((seam, tail))
+
+    if not trims:
+        return segments, []
+
+    kept = []
+    for i, seg in enumerate(segments):
+        if i in drop:
+            continue
+        seam = clamp_at.get(i)
+        if seam is not None and seg["start"] < seam < seg["end"]:
+            seg = dict(seg, end=seam)   # keeps its words, ends at the seam
+        kept.append(seg)
+    return kept, trims
+
+
 def transcribe(audio_path, backend, model_name, language, chunk_mins):
     """
     Transcribe audio_path, splitting into chunks to avoid Whisper hallucination.
@@ -320,15 +412,20 @@ def transcribe(audio_path, backend, model_name, language, chunk_mins):
             result = _run_backend(chunk_path, backend, model_name, language, openai_cache)
 
             elapsed = time.time() - t0
-            text = result["text"].strip()
+            shifted = [dict(seg, start=seg["start"] + start, end=seg["end"] + start)
+                       for seg in result.get("segments", [])]
+            kept = clamp_to_chunk(shifted, start, end)
+            # The .txt is rebuilt from the segments that survived, so it cannot
+            # disagree with the .timestamped.txt about what was said.
+            text = rebuild_text(kept) if shifted else result["text"].strip()
             print(f"→ {len(text.split())} words in {elapsed:.0f}s")
+            if len(kept) < len(shifted):
+                over = max(s["end"] for s in shifted) - end
+                print(f"    dropped {len(shifted) - len(kept)} segment(s) running "
+                      f"up to {over:.0f}s past the end of this chunk")
 
             all_text.append(text)
-            for seg in result.get("segments", []):
-                seg = dict(seg)
-                seg["start"] += start
-                seg["end"] += start
-                all_segments.append(seg)
+            all_segments += kept
 
     return {"text": " ".join(all_text), "segments": all_segments}
 
@@ -602,9 +699,10 @@ examples:
 Audio is read from local/ and transcripts are written to output/, both of
 which are gitignored. The transcript keeps the recording's name.
 
-Every run ends with a diagnose → repair → verify pass that re-transcribes
-hallucinated loops and dropped-speech gaps. Pass --no-repair to skip it, or
-use repair.py to run that cycle against a transcript you already have.
+Every run ends with a diagnose → repair → verify pass that re-transcribes the
+windows Whisper repeated itself in. Gaps are reported but left alone unless
+you pass --include-gaps. Pass --no-repair to skip the whole thing, or use
+repair.py to run that cycle against a transcript you already have.
         """,
     )
     parser.add_argument("audio", help="Audio file to transcribe (a bare name is looked up in local/)")
@@ -671,6 +769,12 @@ use repair.py to run that cycle against a transcript you already have.
         action="store_true",
         help="Only splice a repaired window back in if it comes back completely clean",
     )
+    rep.add_argument(
+        "--include-gaps",
+        action="store_true",
+        help="Also re-decode gaps. Off by default: only repetitions (loops, "
+             "stutters, boilerplate) are repaired, gaps are reported",
+    )
 
     args = parser.parse_args()
 
@@ -707,6 +811,11 @@ use repair.py to run that cycle against a transcript you already have.
             # the pass that cleans up a loop cannot re-create one by decoding a
             # longer stretch than the transcription itself was allowed.
             chunk_mins=args.chunk_size,
+            # Repetitions only unless asked otherwise: those are the windows
+            # this run demonstrably got wrong, and re-decoding them is minutes
+            # of work rather than a second pass over most of the recording.
+            targets=(repair.REPAIRABLE_KINDS if args.include_gaps
+                     else repair.REPETITION_KINDS),
             passes=args.repair_passes,
             strict=args.strict,
         )

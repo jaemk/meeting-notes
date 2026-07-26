@@ -49,8 +49,19 @@ Or directly:
 Every run finishes with an automatic **diagnose → repair → verify** pass:
 
 1. the fresh transcript is scanned for defects,
-2. every repairable one is re-transcribed and spliced back in,
+2. every *targeted* one is re-transcribed and spliced back in,
 3. the result is scanned *again* and anything still outstanding is reported.
+
+**Only the repetitions are targeted.** A loop, a stutter or a line of
+boilerplate is text Whisper demonstrably got wrong, sitting in a window a few
+seconds long — re-decoding it is minutes of work. Gaps are a different animal:
+they are far more numerous, most of them are pauses the audio check could not
+positively rule out, and running Whisper over near-silence is how you get
+"Thanks for watching" where there was nothing. So gaps are *reported* and left
+alone unless you pass `--include-gaps`.
+
+On a 2½-hour meeting that is the difference between 12 decode windows (182s)
+and 29 (391s).
 
 Pass `--no-repair` to keep the raw output, `--repair-model` to re-decode
 defective windows with a different (usually larger) model than the main run,
@@ -63,17 +74,37 @@ for both.
 
 ## What it looks for
 
-| kind      | what it is                                                        | repaired |
-|-----------|-------------------------------------------------------------------|----------|
-| `loop`    | the same line emitted once a second for 20+ seconds                | yes      |
-| `stutter` | a phrase repeated 4+ times inside one segment                      | yes      |
-| `canned`  | "Thanks for watching", "Subtitles by …" and friends                | yes      |
-| `gap`     | 5+ seconds with **speech** underneath that produced no text        | yes      |
-| `silence` | a gap with nothing but silence underneath — correct behaviour      | no       |
-| `rewind`  | timestamps going backwards at a chunk seam                         | no       |
+| kind      | what it is                                                        | repaired          |
+|-----------|-------------------------------------------------------------------|-------------------|
+| `loop`    | the same line emitted once a second for 20+ seconds                | yes               |
+| `stutter` | a phrase repeated 4+ times inside one segment                      | yes               |
+| `canned`  | "Thanks for watching", "Subtitles by …" and friends                | yes               |
+| `gap`     | 5+ seconds with **speech** underneath that produced no text        | `--include-gaps`  |
+| `silence` | a gap with nothing but silence underneath — correct behaviour      | no                |
+| `rewind`  | timestamps going backwards at a chunk seam                         | trimmed, no decode|
 
 Gaps are classified by measuring the audio underneath them with `ffmpeg`, so a
 pause in the conversation is not mistaken for dropped speech.
+
+Rewinds are deleted, not re-decoded. Whisper does not stop where its audio
+does: a chunk that ends mid-loop keeps emitting the same line for another 10–30
+seconds, and merged as-is that tail sorts after the next chunk's opening so time
+appears to run backwards. During transcription each chunk's segments are clamped
+to the audio that chunk covered, so the tail never reaches the file. In a
+transcript that already has one, `repair.py` does the same thing retroactively:
+the tail is text a chunk invented past the end of its own audio, so dropping it
+*is* the fix and it costs no decoding.
+
+That trim needs the recording. Before deleting anything it confirms each seam
+really is a chunk boundary by looking for the silence the split was cut at —
+without that check a transcript whose timestamps are merely disordered would
+have its real speech deleted instead. Given `verify` alone, or `--no-audio-check`,
+rewinds are reported and left alone.
+
+`--include-gaps` means the same thing wherever it appears, and the check and
+the repair share it deliberately: `verify` fails on exactly what a `fix` would
+have gone and re-decoded, so `fix` then `check` converges instead of forever
+reporting gaps nothing was ever going to touch.
 
 None of this is visible in the `.txt` output — you only see it in the
 timestamps, which is why the check runs on its own.
@@ -98,6 +129,7 @@ Or via make, where `INPUT` picks the transcript for you:
     make fix DRY=1                          # preview, decode nothing
     make fix IN_PLACE=1                     # overwrite the transcript, keeps a .bak
     make fix WINDOWS="-w 20:47-21:09 -w 1:49:54-1:50:21"
+    make fix GAPS=1                         # repair dropped speech too
 
 `TRANSCRIPT=<file>` overrides that choice, and `make clean` removes just this
 recording's outputs, leaving the rest of `output/` alone.
@@ -123,6 +155,25 @@ Notes:
 - A window that comes back still broken is retried with double the context and
   then with `--fallback-model`. `--strict` refuses to splice anything that does
   not come back completely clean.
+
+## Asking Claude to look at it
+
+    make analyze                    interactive, seeded with the prompt
+    make analyze PRINT=1            one-shot; prints its findings and exits
+    make analyze PROMPT=<file>      ask something else entirely
+
+`check` and `fix` apply rules. `analyze` is for the judgement calls they can't
+make: whether a gap over loud audio is dropped speech or a round of applause,
+whether a repaired window came back better or worse than what it replaced, which
+of the remaining findings are worth spending compute on. It hands the transcript
+to Claude Code along with `analyze.md` — the reasoning behind all of the above,
+which side of a seam is lying and why, what each defect kind costs to repair,
+and what not to do. `@AUDIO@` and `@TRANSCRIPT@` in that file are filled in with
+whatever `INPUT`/`TRANSCRIPT` resolve to, so the prompt is worth reading and
+editing directly; it is the part of this repo that encodes judgement rather than
+rules.
+
+Requires the `claude` CLI on `PATH` (`CLAUDE=` to point elsewhere).
 
 ## Tests
 

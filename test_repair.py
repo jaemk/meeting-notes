@@ -51,17 +51,29 @@ check("leaves distant alone", R.merge_windows([(0, 10), (100, 110)], 5) == [(0, 
 check("handles empty", R.merge_windows([]) == [])
 check("handles nested", R.merge_windows([(0, 50), (10, 20)], 5) == [(0, 50)])
 w = R.defect_windows(d, 5)
-check("10 repairable defects collapse to 9 windows",
-      (sum(1 for x in d if x.repairable), len(w)) == (10, 9), (len(d), len(w)))
-check("the two gaps 3s apart became one window", (474.0, 495.0) in w, w)
+check("only the 3 repetitions are targeted, not the 7 gaps",
+      (sum(1 for x in d if x.repairable), len(w)) == (10, 3), (len(d), len(w)))
+check("the targeted windows are exactly the planted loops",
+      w == [(short.start, short.end), (big.start, big.end), (rw.start, rw.end)], w)
+wg = R.defect_windows(d, 5, R.REPAIRABLE_KINDS)
+check("--include-gaps widens it to all 10 repairable defects, 9 windows",
+      len(wg) == 9, len(wg))
+check("the two gaps 3s apart became one window", (474.0, 495.0) in wg, wg)
 check("defect_windows ignores non-repairable kinds",
-      R.defect_windows([x for x in d if x.kind == "rewind"], 5) == [])
+      R.defect_windows([x for x in d if x.kind == "rewind"], 5,
+                       R.REPAIRABLE_KINDS) == [])
+check("repetitions are loops, stutters and boilerplate",
+      R.REPETITION_KINDS == ("loop", "stutter", "canned"), R.REPETITION_KINDS)
+check("gaps are repairable but not a repetition",
+      "gap" in R.REPAIRABLE_KINDS and "gap" not in R.REPETITION_KINDS)
 
 check.section("RepairOptions defaults")
 opts = R.RepairOptions()
 check("defaults to auto backend", opts.backend == "auto", opts.backend)
 check("windows are sliced with the same chunk size as a whole file",
       opts.chunk_mins == T.DEFAULT_CHUNK_MINS, opts.chunk_mins)
+check("targets repetitions only, so a fix decodes the defects and not the file",
+      opts.targets == R.REPETITION_KINDS, opts.targets)
 check("large-v2 with a large-v3 fallback",
       (opts.model, opts.fallback_model) == ("large-v2", "large-v3"))
 check("two passes by default", opts.passes == 2)
@@ -160,6 +172,111 @@ fixed3, rep3, remaining3 = R.diagnose_repair_verify(
 check("splice happened but stayed defective",
       any(x.kind == "loop" for x in remaining3), [str(x) for x in remaining3])
 check("verify does not silently report success", any(x.repairable for x in remaining3))
+
+check.section("a repair targets the repetitions, not the whole transcript")
+# The fixture has 3 loops and 7 gaps. A default run should hand the decoder the
+# 3 stretches Whisper got wrong and nothing else — the gaps are reported so you
+# can see them, but decoding all 10 is the broad re-run this default avoids.
+decoded.clear()
+T.transcribe_window = clean_window
+one_pass = R.RepairOptions(backend="mlx", check_audio=False, passes=1)
+_, rep4, rest4 = R.diagnose_repair_verify(None, segs, one_pass, title="test")
+check("decoded the 3 loops only", len(decoded) == 3, decoded)
+check("and those windows were the planted loops",
+      decoded == [(short.start, short.end), (big.start, big.end),
+                  (rw.start, rw.end)], decoded)
+check("gaps survive untouched and are still reported",
+      any(x.kind == "gap" for x in rest4), [str(x) for x in rest4])
+
+decoded.clear()
+with_gaps = R.RepairOptions(backend="mlx", check_audio=False, passes=1,
+                            targets=R.REPAIRABLE_KINDS)
+R.diagnose_repair_verify(None, segs, with_gaps, title="test")
+check("--include-gaps opts back in to all 9 windows", len(decoded) == 9, len(decoded))
+
+check.section("seam overruns are trimmed, never decoded")
+# A chunk that kept decoding past its own seam: 'invented' is the tail, and the
+# next chunk resumes at 300 with what was actually said there.
+_real_silence = T.silence_ends
+seam_tx = [
+    {"start": 290.0, "end": 296.0, "text": "the sentence that was really there"},
+    {"start": 296.0, "end": 303.0, "text": "and this one straddles the seam"},
+    {"start": 303.0, "end": 315.0, "text": "invented past the end of the chunk"},
+    {"start": 300.0, "end": 306.0, "text": "what the next chunk actually heard"},
+    {"start": 306.0, "end": 312.0, "text": "carrying on from there"},
+]
+seam_opts = R.RepairOptions(backend="mlx", check_audio=True, passes=1)
+try:
+    T.silence_ends = lambda audio, start=None, dur=None: []
+    check("a seam with no silence under it is no chunk boundary, so nothing goes",
+          R.trim_seams("fake.m4a", seam_tx, seam_opts) == (seam_tx, []))
+    # The hazard this guard exists for: in the fixture the loop rewinds over
+    # speech that was transcribed correctly, so there the text *after* the seam
+    # is the invention. Trimming it would delete the real lines.
+    kept_fix, trims_fix = R.trim_seams("fake.m4a", segs, seam_opts)
+    check("the fixture's rewind loop is left alone and the speech it buried survives",
+          trims_fix == [] and all(any(s["text"] == d for s in kept_fix)
+                                  for d in FIXTURE.duplicated), trims_fix)
+
+    T.silence_ends = lambda audio, start=None, dur=None: [300.0]
+    kept, trims = R.trim_seams("fake.m4a", seam_tx, seam_opts)
+    check("a seam sitting on a silence boundary is trimmed",
+          [s["text"] for s in kept] == [seam_tx[0]["text"], seam_tx[1]["text"],
+                                        seam_tx[3]["text"], seam_tx[4]["text"]],
+          [s["text"] for s in kept])
+    check("the straddling segment is clamped back to the seam",
+          (kept[1]["start"], kept[1]["end"]) == (296.0, 300.0), kept[1])
+    check("a dry run reports the trim and changes nothing",
+          R.trim_seams("fake.m4a", seam_tx, seam_opts, dry_run=True)[0] is seam_tx)
+    check("without audio it declines to trim rather than guess",
+          R.trim_seams(None, seam_tx, seam_opts) == (seam_tx, []))
+    check("--no-audio-check declines for the same reason",
+          R.trim_seams("fake.m4a", seam_tx,
+                       R.RepairOptions(check_audio=False)) == (seam_tx, []))
+
+    decoded.clear()
+    fixed5, rep5, rest5 = R.diagnose_repair_verify("fake.m4a", seam_tx, seam_opts,
+                                                   title="test")
+    check("the cycle fixed it without decoding anything", decoded == [], decoded)
+    check("no rewind survives the run",
+          not any(x.kind == "rewind" for x in rest5), [str(x) for x in rest5])
+    check("the trim reaches the report, so the caller knows to rewrite the file",
+          [(r[1], r[2]) for r in rep5] == [(R.SEAM_TRIMMED, True)], rep5)
+
+    # Ordering is the whole safeguard, and this is the shape that proves it: a
+    # repair window covering only part of the overrun, so the rest of the tail
+    # survives the splice and the backwards jump with it. Walking back from that
+    # jump then reaches past the leftover tail into the freshly decoded text and
+    # deletes it — the repair eating its own output. Trimming first is what
+    # makes the walk-back safe, because there is no splice for it to reach.
+    order = []
+    def ordered_silence(audio, start=None, dur=None):
+        order.append("trim")
+        return [300.0]
+    def ordered_window(audio, window, *a, **kw):
+        order.append("decode")
+        return [{"start": window[0], "end": window[1], "text": "freshly decoded"}]
+    T.silence_ends, T.transcribe_window = ordered_silence, ordered_window
+    partial_tx = [
+        {"start": 290.0, "end": 296.0, "text": "the sentence that was really there"},
+        {"start": 296.0, "end": 300.0, "text": "and the one before the seam"},
+        {"start": 303.0, "end": 308.0, "text": "invented, and inside the window"},
+        {"start": 308.0, "end": 315.0, "text": "invented, and outside it"},
+        {"start": 300.0, "end": 303.0, "text": "what the next chunk actually heard"},
+    ]
+    fixed6, _, rest6 = R.diagnose_repair_verify("fake.m4a", partial_tx, seam_opts,
+                                                windows=[(303.0, 308.0)], title="test")
+    check("the trim runs before anything is decoded", order[:1] == ["trim"], order)
+    check("so a repair spliced into the overrun's stretch survives it",
+          "freshly decoded" in [s["text"] for s in fixed6],
+          [s["text"] for s in fixed6])
+    check("both halves of the tail go, not just the one the window covered",
+          not [s for s in fixed6 if s["text"].startswith("invented")],
+          [s["text"] for s in fixed6])
+    check("and the transcript still comes out in order",
+          not any(x.kind == "rewind" for x in rest6), [str(x) for x in rest6])
+finally:
+    T.silence_ends, T.transcribe_window = _real_silence, clean_window
 
 check.section("gap classification measures the audio underneath")
 audio = build_audio_fixture()
