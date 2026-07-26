@@ -170,6 +170,17 @@ check("never cuts backwards", all(
         T.chunk_boundaries(0, 300, 60, [10, 20, 250], 90)))))
 check("a window barely over one chunk stays whole",
       T.chunk_boundaries(0, 65, 60, [], 30) == [0, 65])
+check("tolerance is half a chunk", T.chunk_tolerance(60) == 30, T.chunk_tolerance(60))
+check("and is capped for long chunks", T.chunk_tolerance(300) == 90, T.chunk_tolerance(300))
+# regression: the tolerance used to be a flat 90s, so with -c 1 a lone silence
+# at 2:20 would win the 1:00 cut and hand Whisper a 140s chunk — the long
+# decode -c was set to prevent. A hard cut at the target beats that.
+check("a distant silence no longer stretches a chunk past the tolerance",
+      T.chunk_boundaries(0, 300, 60, [140]) == [0, 60, 140, 200, 260, 300],
+      T.chunk_boundaries(0, 300, 60, [140]))
+check("whole-file and window paths agree on the default tolerance",
+      T.chunk_boundaries(0, 300, 60, [140]) ==
+      T.chunk_boundaries(0, 300, 60, [140], T.chunk_tolerance(60)))
 
 check.section("a long repair window is sliced like a whole file (stubbed backend)")
 extracts, decoded = [], []
