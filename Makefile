@@ -19,11 +19,12 @@ ARGS     ?= --model large-v2 -c 1 -l en
 FIX_ARGS ?= --model large-v2 -c 1 -l en
 
 CLAUDE ?= claude
-# The prompt is a file rather than a here-doc so it can be read, reviewed and
+# Prompts are files rather than here-docs so they can be read, reviewed and
 # edited like anything else in the repo. @AUDIO@/@TRANSCRIPT@ are filled in.
-PROMPT ?= analyze.md
+PROMPT         ?= analyze.md
+SUMMARY_PROMPT ?= summarize.md
 
-.PHONY: all transcribe check fix analyze test setup clean distclean
+.PHONY: all transcribe check fix analyze readable test setup clean distclean
 
 all: transcribe
 
@@ -83,9 +84,35 @@ analyze: $(STAMP)
 	$(CLAUDE) $(if $(PRINT),-p,) "$$(sed -e 's|@AUDIO@|$(INPUT)|g' \
 		-e 's|@TRANSCRIPT@|$(TRANSCRIPT)|g' $(PROMPT))"
 
+# The document a person actually reads: an executive summary and a topic-by-
+# topic list of outcomes, follow-ups and owners, written by Claude from the
+# transcript, with the paragraphed transcript underneath it.
+#
+# Two explicit steps, and the summary is the one that costs anything. It is
+# kept as its own file so it can be re-read, edited by hand, or regenerated
+# without rebuilding the document — and so a bad summary is obvious rather than
+# buried in the middle of a 23,000-word file.
+#
+#   make readable                    summarise, then assemble
+#   make readable NO_SUMMARY=1       transcript only, no Claude, no cost
+#   make readable SUMMARY_PROMPT=<f> ask for a different summary
+readable: $(STAMP)
+	$(need_transcript)
+ifndef NO_SUMMARY
+	@test -f "$(SUMMARY_PROMPT)" || { echo "Error: no prompt at '$(SUMMARY_PROMPT)'"; exit 1; }
+	@command -v $(CLAUDE) >/dev/null || { echo "Error: '$(CLAUDE)' not on PATH — see https://claude.com/claude-code"; exit 1; }
+	@echo "Summarising $(TRANSCRIPT) with $(CLAUDE) …"
+	@$(CLAUDE) -p "$$(cat $(SUMMARY_PROMPT))" < $(TRANSCRIPT) > $(OUTPUT).summary.md
+	@test -s $(OUTPUT).summary.md || { echo "Error: the summary came back empty"; exit 1; }
+	@echo "Saved: $(OUTPUT).summary.md"
+endif
+	$(PYTHON) readable.py $(TRANSCRIPT) --output $(OUTPUT).readable.md \
+		$(if $(NO_SUMMARY),,--summary $(OUTPUT).summary.md)
+
 test: $(STAMP)
 	$(PYTHON) test_transcribe.py
 	$(PYTHON) test_repair.py
+	$(PYTHON) test_readable.py
 
 # setup.sh owns every install step; the Makefile only decides when to call it.
 $(STAMP): setup.sh

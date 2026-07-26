@@ -152,6 +152,16 @@ on a boosted file reports everything as speech.
    Expect roughly two thirds to come back with real content.
 5. Bucket A and B: leave them. Neither is recoverable — see above for why.
 6. `make analyze` for anything needing judgement.
+7. `make readable` for the deliverable — Claude writes the summary from
+   `summarize.md` into `output/NAME.summary.md`, then `readable.py` assembles
+   it with the paragraphed transcript underneath. Two steps on purpose: the
+   summary is the only part that costs anything and the only part that can be
+   wrong in a way the transcript is not, so it lands as its own file first.
+
+When summarising, the transcript's own self-corrections matter. A figure stated
+once and then revised a minute later ("actually it's…") is common in a meeting;
+take the last statement, and say when the earlier ones disagreed. Never smooth
+over an inconsistency by picking one silently.
 
 Repairing a transcript made *before* the clamp existed adds one step: the seam
 trim runs automatically at the start of `repair.py repair`, but needs the audio

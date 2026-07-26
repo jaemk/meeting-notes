@@ -156,6 +156,31 @@ Notes:
   then with `--fallback-model`. `--strict` refuses to splice anything that does
   not come back completely clean.
 
+## The document a person reads
+
+    make readable                    summarise with Claude, then assemble
+    make readable NO_SUMMARY=1       transcript only — no Claude, no cost
+    make readable SUMMARY_PROMPT=<f> ask for a different summary
+
+The `.txt` a transcription writes is one unbroken run of words: correct, and
+unusable. `make readable` produces `output/NAME.readable.md` — an executive
+summary and a topic-by-topic list of outcomes, follow-ups and owners, with the
+transcript underneath it broken into paragraphs where the room went quiet and
+timestamped so a passage can be found in the recording. Upload it to Google
+Docs directly; Drive converts Markdown on import.
+
+It is two explicit steps, and only the first costs anything. The summary is
+written by Claude from `summarize.md` and saved as `output/NAME.summary.md`
+before the document is assembled, so it can be re-read, hand-edited, or
+regenerated without rebuilding the transcript — and so a bad summary is obvious
+rather than buried in the middle of a 23,000-word file. `readable.py` runs on
+its own if you only want the formatting.
+
+`summarize.md` is worth reading before you trust the output. It tells Claude
+what the transcript is — machine-generated, single microphone, speakers not
+labelled — and to flag uncertainty rather than fill gaps, which is the
+difference between a summary you can act on and one that invents a number.
+
 ## Asking Claude to look at it
 
     make analyze                    interactive, seeded with the prompt
