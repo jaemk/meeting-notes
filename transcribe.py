@@ -162,13 +162,26 @@ def silence_ends(audio_path, start=None, dur=None):
             for m in re.finditer(r"silence_end: ([\d.]+)", r.stderr)]
 
 
-def chunk_boundaries(start, end, chunk_secs, silences, tolerance, verbose=False):
+def chunk_tolerance(chunk_secs):
+    """
+    How far a cut may drift from its target to reach a silence. Half a chunk,
+    capped: a piece that runs to 1.5× what was asked for is still short enough
+    to be worth the cleaner boundary, but chasing a silence further than that
+    rebuilds the long decode that -c was set to avoid.
+    """
+    return min(90.0, chunk_secs * 0.5)
+
+
+def chunk_boundaries(start, end, chunk_secs, silences, tolerance=None,
+                     verbose=False):
     """
     Cut [start, end] into pieces of about chunk_secs, landing each cut on the
     nearest silence within `tolerance` seconds of the target and falling back
     to a hard cut when there is none nearby. Returns the boundaries including
     both ends, so [a, b, c] means two chunks.
     """
+    if tolerance is None:
+        tolerance = chunk_tolerance(chunk_secs)
     splits = [start]
     target = start + chunk_secs
     while target < end - chunk_secs * 0.2:  # avoid a tiny tail chunk
@@ -189,8 +202,7 @@ def find_split_points(audio_path, chunk_secs, duration):
     print("detecting moments of silence")
     silences = silence_ends(audio_path)
     print(f"found {len(silences)} moments of silence")
-    return chunk_boundaries(0.0, duration, chunk_secs, silences,
-                            tolerance=90, verbose=True)
+    return chunk_boundaries(0.0, duration, chunk_secs, silences, verbose=True)
 
 
 def parse_time(s):
@@ -404,11 +416,8 @@ def window_slices(audio_path, start, end, chunk_secs):
     """
     if end - start <= chunk_secs * 1.1:
         return [start, end]
-    # Tighter than the whole-file tolerance: this stretch is known to decode
-    # badly, so a slice that drifts far past chunk_secs defeats the point.
     return chunk_boundaries(start, end, chunk_secs,
-                            silence_ends(audio_path, start, end - start),
-                            tolerance=min(90.0, chunk_secs * 0.5))
+                            silence_ends(audio_path, start, end - start))
 
 
 def _decode_span(audio_path, span, duration, backend, model_name, language,
