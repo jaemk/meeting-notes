@@ -39,11 +39,11 @@ check("the recording's name carries over to its transcript",
 check("dots in a recording name are not treated as an extension",
       T.default_output(Path("local/team.sync.2026-07-25.m4a")) ==
       T.OUTPUT_DIR / "team.sync.2026-07-25")
-check("a bare stem lands in output/", T.resolve_output("beach") == T.OUTPUT_DIR / "beach")
+check("a bare stem lands in output/", T.resolve_output("audio") == T.OUTPUT_DIR / "audio")
 check("an explicit directory is left alone",
-      T.resolve_output("elsewhere/beach") == Path("elsewhere/beach"))
+      T.resolve_output("elsewhere/audio") == Path("elsewhere/audio"))
 check("resolve_output strips a transcript extension",
-      T.resolve_output("beach.timestamped.txt") == T.OUTPUT_DIR / "beach")
+      T.resolve_output("audio.timestamped.txt") == T.OUTPUT_DIR / "audio")
 check("a bare transcript name is found in output/",
       T.resolve_transcript(FIXTURE.path.name) == FIXTURE.path,
       T.resolve_transcript(FIXTURE.path.name))
@@ -247,7 +247,7 @@ with tempfile.TemporaryDirectory() as d:
     check("writes 3 dotted files",
           names == ["2026-07-25.repaired.srt", "2026-07-25.repaired.timestamped.txt",
                     "2026-07-25.repaired.txt"], names)
-    nested = Path(d) / "does" / "not" / "exist" / "beach"
+    nested = Path(d) / "does" / "not" / "exist" / "audio"
     T.save_output({"text": "hi", "segments": []}, nested, True)
     check("creates the output directory if it is missing",
           (Path(str(nested) + ".txt")).exists())

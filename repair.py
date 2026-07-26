@@ -18,10 +18,10 @@ know is wrong and a window a minute long; gaps are far more numerous and are
 mostly pauses the audio check could not rule out, so decoding them turns a
 targeted fix into a re-run of most of the recording. --include-gaps opts in.
 
-  ./repair.py diagnose beach.m4a beach.timestamped.txt
-  ./repair.py repair   beach.m4a beach.timestamped.txt
-  ./repair.py repair   beach.m4a beach.timestamped.txt -w 20:47-21:09
-  ./repair.py verify   beach.repaired.timestamped.txt
+  ./repair.py diagnose audio.m4a audio.timestamped.txt
+  ./repair.py repair   audio.m4a audio.timestamped.txt
+  ./repair.py repair   audio.m4a audio.timestamped.txt -w 20:47-21:09
+  ./repair.py verify   audio.repaired.timestamped.txt
 
 Audio is looked up in local/ and transcripts in output/, so the bare names
 above work from anywhere.
@@ -524,11 +524,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  %(prog)s diagnose beach.m4a beach.timestamped.txt
-  %(prog)s repair   beach.m4a beach.timestamped.txt --model large-v2 -l en
-  %(prog)s repair   beach.m4a beach.timestamped.txt --in-place
-  %(prog)s repair   beach.m4a beach.timestamped.txt -w 20:47-21:09 --dry-run
-  %(prog)s verify   beach.repaired.timestamped.txt
+  %(prog)s diagnose audio.m4a audio.timestamped.txt
+  %(prog)s repair   audio.m4a audio.timestamped.txt --model large-v2 -l en
+  %(prog)s repair   audio.m4a audio.timestamped.txt --in-place
+  %(prog)s repair   audio.m4a audio.timestamped.txt -w 20:47-21:09 --dry-run
+  %(prog)s verify   audio.repaired.timestamped.txt
 
 Audio is looked up in local/ and transcripts in output/, so bare names work.
 With no -w the windows come from the diagnosis — the repetitions it found,

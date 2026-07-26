@@ -102,7 +102,7 @@ def resolve_backend(requested):
 def _resolve_in(path, directory):
     """
     Look a bare filename up in the directory this repo keeps that kind of file
-    in, so `transcribe.py beach.m4a` finds local/beach.m4a. Anything with a
+    in, so `transcribe.py audio.m4a` finds local/audio.m4a. Anything with a
     directory component, or that already exists, is returned untouched.
     """
     p = Path(path)
@@ -690,11 +690,11 @@ def main():
         epilog="""
 examples:
   %(prog)s 2026-07-25.m4a                     # local/2026-07-25.m4a -> output/2026-07-25.*
-  %(prog)s local/beach.m4a --model large-v3
-  %(prog)s beach.m4a --backend openai --model small
-  %(prog)s beach.m4a --chunk-size 5
-  %(prog)s beach.m4a --output my_transcript   # -> output/my_transcript.*
-  %(prog)s beach.m4a --language en
+  %(prog)s local/audio.m4a --model large-v3
+  %(prog)s audio.m4a --backend openai --model small
+  %(prog)s audio.m4a --chunk-size 5
+  %(prog)s audio.m4a --output my_transcript   # -> output/my_transcript.*
+  %(prog)s audio.m4a --language en
 
 Audio is read from local/ and transcripts are written to output/, both of
 which are gitignored. The transcript keeps the recording's name.
