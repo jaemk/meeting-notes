@@ -12,6 +12,7 @@ tests assert is therefore a property of this file rather than of a recording
 nobody else has, and a fresh clone can run the suite.
 """
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +50,25 @@ REWIND_LOOP_TEXT = "I'm not sure about that."
 SHORT_LOOP_TEXT = "Right."
 BEFORE_BIG_LOOP = "Anyway, back to the schedule for a moment."
 AFTER_BIG_LOOP = "So that is the part I wanted to flag."
+
+
+class _Fixture(SimpleNamespace):
+    """
+    A SimpleNamespace whose `.path` writes the fixture file to disk the first
+    time it is read, instead of as a side effect of building the object.
+    `import testlib` alone never touches output/; every suite that needs the
+    file reads FIXTURE.path right after importing, which writes it exactly
+    when it is needed and never again after that.
+    """
+
+    @property
+    def path(self):
+        if not self._written:
+            # Set the flag before writing: write_fixture() reads `.path`
+            # back, and this is what stops that from recursing.
+            self._written = True
+            write_fixture(self)
+        return self._path
 
 
 def build_fixture():
@@ -113,8 +133,9 @@ def build_fixture():
     speech(10, gap_after=6.0)
     speech(15)
 
-    return SimpleNamespace(
-        path=OUTPUT_DIR / "fixture.timestamped.txt",
+    return _Fixture(
+        _written=False,
+        _path=OUTPUT_DIR / "fixture.timestamped.txt",
         segments=segs,
         loops=loops,
         short_loop=loops[0],
@@ -147,13 +168,45 @@ def write_fixture(fixture):
 
 
 FIXTURE = build_fixture()
-write_fixture(FIXTURE)
 
 FIXTURE_AUDIO = OUTPUT_DIR / "fixture-audio.wav"
 # Where each stretch of that file falls, for the checks that measure it.
 AUDIO_TONE = (0.0, 10.0)
 AUDIO_SILENCE = (10.0, 20.0)
 AUDIO_MIXED = (5.0, 25.0)
+# tone(10s) + silence(10s) + tone(10s), what build_audio_fixture concatenates.
+_AUDIO_FIXTURE_DURATION = AUDIO_TONE[1] + (AUDIO_SILENCE[1] - AUDIO_SILENCE[0]) + AUDIO_TONE[1]
+
+
+def _probe_duration(path):
+    """
+    A file's length in seconds, independent of transcribe.get_duration's own
+    cache — this is used to decide whether to *rebuild* a cached fixture, and
+    sharing that cache would let a probe of a stale/truncated file poison the
+    duration transcribe.py itself reports after the rebuild.
+    """
+    r = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format",
+         "-i", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(json.loads(r.stdout)["format"]["duration"])
+
+
+def _audio_fixture_is_valid():
+    """
+    True when FIXTURE_AUDIO exists and is a complete render of the fixture,
+    not the truncated remains of an ffmpeg run that was interrupted midway.
+    Existence alone can't tell those apart, so this probes the file's actual
+    duration against the length the generator below always produces.
+    """
+    if not FIXTURE_AUDIO.exists():
+        return False
+    try:
+        return abs(_probe_duration(FIXTURE_AUDIO) - _AUDIO_FIXTURE_DURATION) < 0.5
+    except (OSError, subprocess.CalledProcessError, KeyError, ValueError,
+            json.JSONDecodeError):
+        return False
 
 
 def build_audio_fixture():
@@ -162,8 +215,12 @@ def build_audio_fixture():
     dropped speech is the gap classifier's entire job and it does that by
     measuring sound, so those checks need real audio — but not anyone's
     recording. Returns None if ffmpeg is missing, so the checks skip instead.
+
+    A cached file is revalidated by probing its duration rather than trusted
+    on sight, so a truncated leftover from an interrupted run gets rebuilt
+    instead of reused forever.
     """
-    if FIXTURE_AUDIO.exists():
+    if _audio_fixture_is_valid():
         return FIXTURE_AUDIO
     FIXTURE_AUDIO.parent.mkdir(parents=True, exist_ok=True)
     tone = "sine=frequency=300:duration=10:sample_rate=16000"
@@ -203,13 +260,20 @@ class Checks:
         self.skipped += 1
         print(f"  SKIP {name} ({why})")
 
-    def raises(self, name, fn, *a, **kw):
+    def raises(self, name, fn, *a, expect=None, **kw):
         # SystemExit is a BaseException, and argparse/CLI guards raise it —
         # a bare `except Exception` would let those through as a crash.
+        # `expect=` optionally pins down which exception is actually being
+        # asserted (e.g. expect=argparse.ArgumentTypeError), so a signature
+        # change that makes the call fail for an unrelated reason (say,
+        # TypeError) doesn't get reported as the rejection under test.
+        # Defaults to today's behaviour: any Exception/SystemExit passes.
         try:
             fn(*a, **kw)
-        except (Exception, SystemExit):
-            self(name, True)
+        except (Exception, SystemExit) as e:
+            ok = expect is None or isinstance(e, expect)
+            detail = "" if ok else f"expected {expect}, got {type(e).__name__}: {e}"
+            self(name, ok, detail)
         else:
             self(name, False, "no exception raised")
 
