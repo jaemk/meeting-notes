@@ -10,12 +10,17 @@ Whisper fails in two ways that a plain transcription run won't tell you about:
           transcript just jumps forward in time
 
 Both are invisible in the .txt output — you only see them by looking at the
-timestamps. This finds them, re-transcribes just the affected windows, and
-splices the result back in.
+timestamps. This finds them, re-transcribes just the affected windows, splices
+the result back in, and then re-runs the check to report what is left.
 
   ./repair.py diagnose beach.m4a transcript.timestamped.txt
   ./repair.py repair   beach.m4a transcript.timestamped.txt
-  ./repair.py verify   transcript.fixed.timestamped.txt
+  ./repair.py repair   beach.m4a transcript.timestamped.txt -w 20:47-21:09
+  ./repair.py verify   transcript.repaired.timestamped.txt
+
+transcribe.py runs this same cycle automatically at the end of a transcription;
+the commands above are for a transcript you already have, or for overriding
+which windows get re-decoded.
 
 Gaps are classified by measuring the audio underneath them: a gap over silence
 is correct behaviour and is left alone, a gap over speech is lost content.
@@ -25,9 +30,27 @@ import argparse
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import transcribe as T
+
+
+@dataclass
+class RepairOptions:
+    """Everything repair needs to decode. Shared by the CLI and transcribe.py."""
+    backend: str = "auto"
+    model: str = "large-v2"
+    fallback_model: str = "large-v3"
+    language: Optional[str] = None
+    pad: float = 15.0
+    join_within: float = 5.0
+    strict: bool = False
+    passes: int = 2
+    min_run: int = 3
+    min_gap: float = 5.0
+    check_audio: bool = True
 
 
 # ── Defect detection ───────────────────────────────────────────────────────────
@@ -165,11 +188,11 @@ def merge_windows(windows, join_within=5.0):
 
 # ── Repair ─────────────────────────────────────────────────────────────────────
 
-def attempt_window(audio_path, window, args, attempt):
+def attempt_window(audio_path, window, opts, attempt):
     """One re-transcription attempt. Returns (segments, problems)."""
     segs = T.transcribe_window(
-        audio_path, window, args.backend, attempt.get("model", args.model),
-        args.language, attempt.get("pad", args.pad), condition_on_prev=False,
+        audio_path, window, opts.backend, attempt.get("model", opts.model),
+        opts.language, attempt.get("pad", opts.pad), condition_on_prev=False,
     )
     problems = []
     if T.find_repeats(segs):
@@ -183,7 +206,7 @@ def attempt_window(audio_path, window, args, attempt):
     return segs, problems
 
 
-def repair_window(audio_path, window, args):
+def repair_window(audio_path, window, opts):
     """
     Re-transcribe a window, escalating if the result is still bad. Whisper is
     stochastic enough that a wider context or a different model usually breaks
@@ -191,14 +214,14 @@ def repair_window(audio_path, window, args):
     """
     plan = [
         {},
-        {"pad": args.pad * 2},
-        {"model": args.fallback_model, "pad": args.pad * 2},
+        {"pad": opts.pad * 2},
+        {"model": opts.fallback_model, "pad": opts.pad * 2},
     ]
     best, best_problems = None, ["not attempted"]
     for n, attempt in enumerate(plan, 1):
         label = ", ".join(f"{k}={v}" for k, v in attempt.items()) or "defaults"
         print(f"    attempt {n}/{len(plan)} ({label})")
-        segs, problems = attempt_window(audio_path, window, args, attempt)
+        segs, problems = attempt_window(audio_path, window, opts, attempt)
         if not problems:
             return segs, []
         print(f"      → {'; '.join(problems)}")
@@ -207,43 +230,106 @@ def repair_window(audio_path, window, args):
     return best, best_problems
 
 
-def repair(audio_path, segments, defects, args):
-    """Repair every repairable defect. Returns (segments, report)."""
+def defect_windows(defects, join_within=5.0):
+    """The decode windows that cover every repairable defect."""
     targets = [d for d in defects if d.repairable]
-    if not targets:
-        return segments, []
+    return merge_windows([(d.start, d.end) for d in targets], join_within)
 
-    windows = merge_windows([(d.start, d.end) for d in targets], args.join_within)
-    print(f"{len(targets)} repairable defects → {len(windows)} decode windows\n")
 
+def repair(audio_path, segments, windows, opts, dry_run=False):
+    """
+    Re-transcribe each window and splice it into `segments`. This is the only
+    place a window gets decoded and merged — automatic (windows from diagnose)
+    and manual (windows from -w) repairs both come through here.
+
+    Returns (segments, report) where a report row is
+    (window, status, spliced, old_words, new_words).
+    """
     report = []
     for n, window in enumerate(windows, 1):
         target = T.snap_window(segments, window)
-        print(f"[{n}/{len(windows)}] {T.fmt_time(target[0])}–{T.fmt_time(target[1])} "
-              f"({target[1] - target[0]:.0f}s)")
-
-        new, problems = repair_window(audio_path, target, args)
-        if new is None:
-            print("    ✗ no usable output — leaving as is\n")
-            report.append((target, "failed", 0, 0))
-            continue
+        label = f"{T.fmt_time(target[0])}–{T.fmt_time(target[1])}"
+        if target != tuple(window):
+            label += f" (snapped from {T.fmt_time(window[0])}–{T.fmt_time(window[1])})"
+        print(f"[{n}/{len(windows)}] {label} ({target[1] - target[0]:.0f}s)")
 
         before = [s for s in segments if s["end"] > target[0] and s["start"] < target[1]]
         old_words = sum(len(s["text"].split()) for s in before)
+
+        if dry_run:
+            print(f"    would replace {len(before)} segments ({old_words} words):")
+            for s in before[:6]:
+                print(f"      [{T.fmt_time(s['start'])}] {s['text'][:60]}")
+            if len(before) > 6:
+                print(f"      … and {len(before) - 6} more")
+            print()
+            report.append((target, "dry-run", False, old_words, old_words))
+            continue
+
+        new, problems = repair_window(audio_path, target, opts)
+        if new is None:
+            print("    ✗ no usable output — leaving as is\n")
+            report.append((target, "failed", False, old_words, old_words))
+            continue
+
         new_words = sum(len(s["text"].split()) for s in new)
 
-        if problems and args.strict:
+        if problems and opts.strict:
             print(f"    ✗ {'; '.join(problems)} — skipping (strict)\n")
-            report.append((target, "skipped: " + "; ".join(problems), old_words, old_words))
+            report.append((target, "skipped: " + "; ".join(problems), False,
+                           old_words, old_words))
             continue
 
         segments, removed = T.splice(segments, target, new)
         status = "repaired" if not problems else "partial: " + "; ".join(problems)
         print(f"    ✓ {len(removed)} segments ({old_words} words) → "
               f"{len(new)} segments ({new_words} words)\n")
-        report.append((target, status, old_words, new_words))
+        report.append((target, status, True, old_words, new_words))
 
     return segments, report
+
+
+def diagnose_repair_verify(audio_path, segments, opts, windows=None,
+                           dry_run=False, title="Repair"):
+    """
+    The whole cycle: find the defects, re-transcribe them, then check again.
+
+    Each pass re-diagnoses the spliced result, so a window that came back with
+    a fresh loop or left a hole behind is picked up by the next pass rather
+    than shipping unnoticed. Returns (segments, report, remaining_defects) —
+    the remaining defects being the final check nothing else is outstanding.
+    """
+    def scan(segs):
+        return diagnose(segs, audio_path, opts.min_run, opts.min_gap, opts.check_audio)
+
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+    defects = scan(segments)
+    print_diagnosis(defects, segments)
+
+    report = []
+    for p in range(1, opts.passes + 1):
+        todo = list(windows) if windows else defect_windows(defects, opts.join_within)
+        if not todo:
+            print(f"\nPass {p}: nothing left to repair.")
+            break
+        print(f"\n── Pass {p}/{opts.passes} " + "─" * 40)
+        print(f"{len(todo)} decode window(s)\n")
+        segments, rep = repair(audio_path, segments, todo, opts, dry_run)
+        report += rep
+        if dry_run or windows:
+            break  # explicit windows are decoded once, not re-derived per pass
+        defects = scan(segments)
+
+    print_report(report)
+    if not dry_run:
+        print("\nFinal check:")
+        defects = scan(segments)
+        print_diagnosis(defects, segments)
+        remaining = [d for d in defects if d.repairable]
+        print("\n✓ transcript is clean — no loops or unexplained gaps left."
+              if not remaining else
+              f"\n⚠ {len(remaining)} defect(s) still unresolved (listed above).")
+    return segments, report, defects
 
 
 # ── Reporting ──────────────────────────────────────────────────────────────────
@@ -277,9 +363,9 @@ def print_report(report):
     if not report:
         return
     print("=" * 60)
-    ok = sum(1 for _, s, _, _ in report if s == "repaired")
+    ok = sum(1 for _, s, _, _, _ in report if s == "repaired")
     print(f"REPAIR SUMMARY — {ok}/{len(report)} windows clean")
-    for (a, b), status, old_w, new_w in report:
+    for (a, b), status, _, old_w, new_w in report:
         print(f"  {T.fmt_time(a)}–{T.fmt_time(b)}  {status}  "
               f"({old_w} → {new_w} words)")
 
@@ -304,7 +390,11 @@ examples:
   %(prog)s diagnose beach.m4a transcript.timestamped.txt
   %(prog)s repair   beach.m4a transcript.timestamped.txt --model large-v2 -l en
   %(prog)s repair   beach.m4a transcript.timestamped.txt --in-place
-  %(prog)s verify   transcript.fixed.timestamped.txt
+  %(prog)s repair   beach.m4a transcript.timestamped.txt -w 20:47-21:09 --dry-run
+  %(prog)s verify   transcript.repaired.timestamped.txt
+
+With no -w the windows come from the diagnosis; with -w only those stretches
+are re-decoded. Either way it is the same splice-and-recheck path.
         """,
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -318,10 +408,15 @@ examples:
     r.add_argument("audio")
     r.add_argument("transcript")
     add_common(r)
+    r.add_argument("--window", "-w", type=T.parse_window, action="append",
+                   metavar="START-END",
+                   help="Repair only this stretch, e.g. 1:49:54-1:50:21 or 6594-6621. "
+                        "Repeatable. Skips defect detection for window selection.")
     r.add_argument("--model", "-m", default="large-v2", choices=T.MODELS)
     r.add_argument("--fallback-model", default="large-v3", choices=T.MODELS,
                    help="Model to retry with when the first pass still loops")
-    r.add_argument("--backend", "-b", default="mlx", choices=["mlx", "openai"])
+    r.add_argument("--backend", "-b", default="auto", choices=T.BACKENDS,
+                   help="Backend (default: auto — mlx on Apple Silicon, else openai)")
     r.add_argument("--language", "-l", default=None)
     r.add_argument("--pad", type=float, default=15.0,
                    help="Context seconds decoded either side of a window (default: 15)")
@@ -334,6 +429,8 @@ examples:
                    help="Only splice a window if it comes back completely clean")
     r.add_argument("--passes", type=int, default=2,
                    help="Diagnose/repair rounds (default: 2)")
+    r.add_argument("--dry-run", action="store_true",
+                   help="Print what would be replaced, decode and write nothing")
 
     v = sub.add_parser("verify", help="Re-scan a transcript and exit nonzero if defective")
     v.add_argument("transcript")
@@ -341,52 +438,46 @@ examples:
     add_common(v)
 
     args = ap.parse_args()
+    segments = T.load_timestamped(args.transcript)
 
-    if args.cmd == "verify":
-        segments = T.load_timestamped(args.transcript)
+    if args.cmd in ("verify", "diagnose"):
+        # diagnose takes audio positionally, verify as an optional flag; both
+        # land on args.audio and both gate the exit status on what they find.
         defects = diagnose(segments, args.audio, args.min_run, args.min_gap,
                            args.check_audio and bool(args.audio))
         print_diagnosis(defects, segments)
         sys.exit(1 if any(d.repairable for d in defects) else 0)
 
-    segments = T.load_timestamped(args.transcript)
-    print(f"Loaded {len(segments)} segments from {args.transcript}\n")
-    defects = diagnose(segments, args.audio, args.min_run, args.min_gap, args.check_audio)
+    print(f"Loaded {len(segments)} segments from {args.transcript}")
+    opts = RepairOptions(
+        backend=T.resolve_backend(args.backend), model=args.model,
+        fallback_model=args.fallback_model, language=args.language,
+        pad=args.pad, join_within=args.join_within, strict=args.strict,
+        passes=args.passes, min_run=args.min_run, min_gap=args.min_gap,
+        check_audio=args.check_audio,
+    )
+    print(f"Backend:  {opts.backend}  model={opts.model} "
+          f"(fallback {opts.fallback_model})")
 
-    if args.cmd == "diagnose":
-        print_diagnosis(defects, segments)
-        sys.exit(1 if any(d.repairable for d in defects) else 0)
+    segments, report, defects = diagnose_repair_verify(
+        args.audio, segments, opts, windows=sorted(args.window or []) or None,
+        dry_run=args.dry_run, title=f"Repairing {args.transcript}",
+    )
 
-    print_diagnosis(defects, segments)
-    print()
-
-    report = []
-    for p in range(1, args.passes + 1):
-        repairable = [x for x in defects if x.repairable]
-        if not repairable:
-            print(f"Pass {p}: nothing left to repair.")
-            break
-        print(f"── Pass {p}/{args.passes} " + "─" * 40)
-        segments, rep = repair(args.audio, segments, defects, args)
-        report += rep
-        defects = diagnose(segments, args.audio, args.min_run, args.min_gap,
-                           args.check_audio)
-
-    print_report(report)
-    print("\nRemaining after repair:")
-    print_diagnosis(defects, segments)
+    if args.dry_run:
+        print("\nDry run — nothing transcribed, nothing written.")
+        sys.exit(0)
 
     stem = (T.output_stem(args.output) if args.output
             else T.output_stem(args.transcript) if args.in_place
             else Path(str(T.output_stem(args.transcript)) + ".repaired"))
     if args.in_place:
-        src = Path(args.transcript)
-        backup = src.with_suffix(src.suffix + ".bak")
-        backup.write_text(src.read_text())
-        print(f"\nBacked up original: {backup}")
+        print(f"\nBacked up original: {T.backup_file(args.transcript)}")
 
     segments.sort(key=lambda s: (s["start"], s["end"]))
     T.save_output({"text": T.rebuild_text(segments), "segments": segments}, stem, True)
+    # Exit 0 — the repair itself succeeded and the output is written. Anything
+    # it could not fix is reported above; `verify` is the pass/fail gate.
 
 
 if __name__ == "__main__":

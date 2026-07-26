@@ -1,45 +1,62 @@
 VENV   := .venv
 PYTHON := $(VENV)/bin/python
+STAMP  := $(VENV)/.setup-complete
 
-# Override with INPUT=<file> or env var
-INPUT  ?= $(firstword $(wildcard input.*))
-# OUTPUT is the stem — script appends .txt / .srt / .timestamped.txt
-# Override with OUTPUT=my_name or env var
+# Input audio. Override with INPUT=<file> or an env var.
+INPUT  ?= $(firstword $(wildcard input.*) $(wildcard local/input.*))
+# OUTPUT is the stem — the script appends .txt / .srt / .timestamped.txt
 OUTPUT ?= transcript
+# The transcript that check/fix operate on
+TRANSCRIPT ?= $(OUTPUT).timestamped.txt
 
-# Pass extra flags: make ARGS="--model large-v3 --backend openai"
-ARGS   ?= --model large-v2 -c 1 -l en
+# Extra flags: make ARGS="--model large-v3 --backend openai"
+ARGS     ?= --model large-v2 -c 1 -l en
+# repair.py takes no --chunk-size, so `fix` gets its own defaults
+FIX_ARGS ?= --model large-v2 -l en
 
-.PHONY: all transcribe fix test setup clean distclean
+.PHONY: all transcribe check fix test setup clean distclean
 
 all: transcribe
 
-transcribe: $(PYTHON)
-	@test -n "$(INPUT)" || { echo "Error: no file matching 'input.*' found — pass INPUT=<file>"; exit 1; }
-	$(PYTHON) transcribe.py $(INPUT) --output $(OUTPUT) $(ARGS)
+define need_input
+@test -n "$(INPUT)" || { echo "Error: no file matching 'input.*' found — pass INPUT=<file>"; exit 1; }
+endef
 
-# Re-transcribe bad windows and splice them into $(OUTPUT).timestamped.txt.
-#   make fix WINDOWS="-w 20:47-21:09 -w 1:49:54-1:50:21"
-#   make fix WINDOWS="-w 20:47-21:09" DRY=1        # preview only
-#   make fix WINDOWS="-w 20:47-21:09" IN_PLACE=1   # overwrite (keeps a .bak)
-fix: $(PYTHON)
-	@test -n "$(INPUT)" || { echo "Error: no file matching 'input.*' found — pass INPUT=<file>"; exit 1; }
-	@test -n "$(WINDOWS)" || { echo "Error: pass WINDOWS=\"-w START-END [-w ...]\""; exit 1; }
-	$(PYTHON) transcribe.py $(INPUT) --merge $(OUTPUT).timestamped.txt \
-		$(WINDOWS) $(ARGS) $(if $(IN_PLACE),--in-place,) $(if $(DRY),--dry-run,)
+# Transcribe, then automatically diagnose → repair → re-check.
+# Pass NO_REPAIR=1 to stop after the raw transcription.
+transcribe: $(STAMP)
+	$(need_input)
+	$(PYTHON) transcribe.py $(INPUT) --output $(OUTPUT) $(ARGS) \
+		$(if $(NO_REPAIR),--no-repair,)
 
-test: $(PYTHON)
+# Report loops/gaps in an existing transcript. Exits nonzero if any remain.
+check: $(STAMP)
+	$(PYTHON) repair.py verify $(TRANSCRIPT) $(if $(INPUT),--audio $(INPUT),)
+
+# Run the repair pass on its own, against an existing transcript.
+#   make fix                                  repair every defect it finds
+#   make fix WINDOWS="-w 20:47-21:09"         repair only these stretches
+#   make fix DRY=1                            preview, decode nothing
+#   make fix IN_PLACE=1                       overwrite $(TRANSCRIPT), keeps a .bak
+fix: $(STAMP)
+	$(need_input)
+	$(PYTHON) repair.py repair $(INPUT) $(TRANSCRIPT) $(FIX_ARGS) $(WINDOWS) \
+		$(if $(IN_PLACE),--in-place,) $(if $(DRY),--dry-run,)
+
+test: $(STAMP)
 	$(PYTHON) test_transcribe.py
+	$(PYTHON) test_repair.py
 
-$(PYTHON):
-	python3 -m venv $(VENV)
-	$(PYTHON) -m pip install --quiet --upgrade pip
-	$(PYTHON) -m pip install --quiet mlx-whisper openai-whisper
+# setup.sh owns every install step; the Makefile only decides when to call it.
+$(STAMP): setup.sh
+	./setup.sh
 
-setup: $(PYTHON)
+setup:
+	./setup.sh
 
 clean:
-	rm -f $(OUTPUT).txt $(OUTPUT).timestamped.txt $(OUTPUT).srt
+	rm -f $(OUTPUT).txt $(OUTPUT).timestamped.txt $(OUTPUT).srt \
+	      $(OUTPUT).repaired.* $(OUTPUT).*.bak
 
 distclean: clean
 	rm -rf $(VENV)
