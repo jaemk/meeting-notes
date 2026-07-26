@@ -68,17 +68,28 @@ cheaper: a hallucinated tail that is already gone needs no window spent on it.
 
 ## Triaging gaps: measure dynamics, not level
 
-Peak level alone does not distinguish speech from applause. Sample the gap in
-1-second slices and look at the **spread** between the quietest and loudest
-second:
+The detector (`gap_is_speech` in repair.py) only ever looks at mean level and
+silence ratio — it deliberately does not look at peak or dynamics at all (see
+`spec/gap-classification.md`, GAP-6). Everything below this point is human
+judgement, not detector behaviour: peak level alone does not distinguish
+speech from applause, so sample the gap in 1-second slices and look at the
+**spread** between the quietest and loudest second:
 
-- **Loud and flat** (peak > −28 dB, spread < 9 dB) → applause, room noise,
+- **(A) Loud and flat** (peak > −28 dB, spread < 9 dB) → applause, room noise,
   everyone talking at once. Not a defect. Decoding these is precisely how you
   get "Thanks for watching" in the transcript. Leave them.
-- **Mid-level with 10–20 dB of spread** → speech rhythm. Worth a decode; about
-  two thirds come back with real content.
-- **Quiet throughout** (peak < −32 dB) → off-mic speech below where the VAD
-  engages. A plain re-decode returns nothing. Amplify first (see below).
+- **(B) Mid-level with 10–20 dB of spread** → speech rhythm. Worth a decode;
+  about two thirds come back with real content.
+- **(C) Quiet throughout** (peak < −32 dB) → off-mic speech below where the
+  VAD engages. A plain re-decode returns nothing. Amplify first (see below).
+
+`repair.py` applies this itself: A and C are reported with their numbers and
+are never chosen as repair windows, even under `--include-gaps`, so only B is
+left to decode. The thresholds are `--ambient-peak-db` (−28), `--ambient-spread-db`
+(9) and `--off-mic-peak-db` (−32) — flags, not constants, because three of the
+fifteen gaps here sat within 0.3 dB of the spread line. Where the dynamics
+cannot be measured at all (under two whole seconds, or an ffmpeg without
+`astats`) the old level-only verdict stands and nothing is bucketed.
 
 A uniform inter-segment spacing (e.g. the same line every 0.84s) is a loop
 signature, not someone repeating themselves.
@@ -108,7 +119,7 @@ other three duplicated their neighbours. Boosting the level does not put
 information into the audio that the microphone never captured; it just gives
 Whisper more room to hallucinate from surrounding speech.
 
-Treat a bucket-B gap as unrecoverable from a single-channel recording. The fix
+Treat a bucket-C gap as unrecoverable from a single-channel recording. The fix
 is at record time — a second microphone or a room mic — not in post.
 
 If you try it anyway, **verify against the original audio**: gap classification
@@ -147,16 +158,19 @@ on a boosted file reports everything as speech.
 1. `make transcribe INPUT=local/NAME.m4a` — chunks, merges with clamping, then
    runs diagnose → repair → verify automatically. Rewinds cannot occur.
 2. `make check INPUT=local/NAME.m4a` — what's left.
-3. Triage the gaps by dynamics (above). Only bucket C earns a decode.
-4. Bucket C: `make fix ... WINDOWS="-w ..." FIX_ARGS="--model large-v3 -c 1 -l en --pad 30 --strict"`
+3. Triage the gaps by dynamics (above) — `make check` already does, and only
+   lists bucket B under `GAP`. Read the numbers on the A and C rows before
+   moving a threshold.
+4. Bucket B: `make fix ... WINDOWS="-w ..." FIX_ARGS="--model large-v3 -c 1 -l en --pad 30 --strict"`
    Expect roughly two thirds to come back with real content.
-5. Bucket A and B: leave them. Neither is recoverable — see above for why.
-6. `make analyze` for anything needing judgement.
-7. `make readable` for the deliverable — Claude writes the summary from
-   `summarize.md` into `output/NAME.summary.md`, then `readable.py` assembles
-   it with the paragraphed transcript underneath. Two steps on purpose: the
-   summary is the only part that costs anything and the only part that can be
-   wrong in a way the transcript is not, so it lands as its own file first.
+5. Bucket A and C: leave them. Neither is recoverable — see above for why.
+6. `make analyze INPUT=local/NAME.m4a` for anything needing judgement.
+7. `make readable INPUT=local/NAME.m4a` for the deliverable — Claude writes the
+   summary from `summarize.md` into `output/NAME.summary.md`, then `readable.py`
+   assembles it with the paragraphed transcript underneath. Two steps on
+   purpose: the summary is the only part that costs anything and the only part
+   that can be wrong in a way the transcript is not, so it lands as its own
+   file first.
 
 When summarising, the transcript's own self-corrections matter. A figure stated
 once and then revised a minute later ("actually it's…") is common in a meeting;
@@ -165,8 +179,11 @@ over an inconsistency by picking one silently.
 
 Repairing a transcript made *before* the clamp existed adds one step: the seam
 trim runs automatically at the start of `repair.py repair`, but needs the audio
-(`--audio` on `verify`, or the positional argument on `repair`). Without it,
-rewinds are reported and left alone, which is the correct conservative default.
+(the positional argument on `repair`). Without it, rewinds are reported and
+left alone, which is the correct conservative default. `verify`'s `--audio`
+flag is unrelated — it only enables gap audio classification and never calls
+the trim, so `verify`/`diagnose` alone will never trim a seam no matter what
+you pass it.
 
 ## Verifying your own work
 
@@ -184,10 +201,11 @@ by measurement — these are a few lines each against `T.load_timestamped`:
 
 ## Tests
 
-    make test        # test_transcribe.py + test_repair.py, decoding stubbed
+    make test        # test_transcribe.py + test_repair.py + test_readable.py
+                      # + test_prompt.py, decoding stubbed
 
-Both suites use `testlib.py`'s `Checks` harness: `check("prose describing the
-property", condition, detail_on_failure)` grouped by `check.section(...)`.
+All four suites use `testlib.py`'s `Checks` harness: `check("prose describing
+the property", condition, detail_on_failure)` grouped by `check.section(...)`.
 Check names read as sentences about behaviour, not as function names. Every
 number asserted is a property of the fixture generator, so a fresh clone runs
 the whole suite. Add a regression test whenever a bug turns out to be an

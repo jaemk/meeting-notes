@@ -52,5 +52,11 @@ will act on, and they are also what a transcription most often gets wrong. If a
 figure appears only once and sounds implausible in context, flag it as
 uncertain rather than repeating it flatly.
 
+**Self-corrections matter.** A figure or a fact stated once and then revised
+a minute later ("actually it's…") is common in a meeting. Take the last
+statement, and say when the earlier ones disagreed — "originally quoted at
+$40k, later corrected to $45k" is the useful version. Never smooth over an
+inconsistency by silently picking one number and dropping the other.
+
 If the recording ends mid-discussion, or a topic is clearly cut off, say that
 at the end of the executive summary.

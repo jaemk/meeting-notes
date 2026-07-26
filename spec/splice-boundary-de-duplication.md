@@ -36,3 +36,10 @@ more.
 For scale: a clean 2½-hour transcript carried roughly 54 boundary echoes before
 any repair work, so this is endemic to segmentation rather than introduced by
 splicing. Splicing adds a small number on top.
+
+## DEDUP-6
+
+This is not `REPAIR-13`. That one is about *where* a replacement is inserted —
+a gap window has no segments to displace, so its position comes from the clock.
+This one is about text repeated at the *edges* of a replacement that landed in
+the right place. Fixing either leaves the other exactly as it was.

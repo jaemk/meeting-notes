@@ -8,7 +8,10 @@ remaining findings is worth spending compute on.
 ## ANALYZE-1
 
 `make analyze` substitutes the resolved audio and transcript paths into
-`analyze.md` and hands the result to the `claude` CLI.
+`analyze.md` and hands the result to the `claude` CLI. The substitution is done
+by `prompt.py`, not by a `sed` expression inside the recipe: `@AUDIO@` and
+`@TRANSCRIPT@` are replaced with the literal paths, whatever characters those
+contain, and the rendered prompt goes to stdout for the recipe to pass on.
 
 ## ANALYZE-2
 
@@ -38,3 +41,10 @@ learned about how a recording fails.
 context — and states explicitly what not to do, since the expensive mistakes
 here are actions (re-running the pipeline, decoding every gap) rather than
 omissions.
+
+## ANALYZE-7
+
+Because rendering is a module rather than a shell fragment, it is testable:
+`test_prompt.py` covers it. A prompt that silently lost a placeholder, or that
+broke on a path containing a character the shell or `sed` reads as syntax, is a
+Claude session spent reasoning about the wrong file.

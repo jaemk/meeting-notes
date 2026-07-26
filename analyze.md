@@ -11,7 +11,7 @@ detector is a set of heuristics and it is wrong at the edges in both directions.
 ## What you have
 
     @AUDIO@                     the recording
-    @TRANSCRIPT@                one segment per line, `[HH:MM:SS.mmm] text`
+    @TRANSCRIPT@                one segment per line, `[HH:MM:SS.ss --> HH:MM:SS.ss]  text`
     .venv/bin/python            the interpreter (never the system python)
     repair.py                   diagnose / repair / verify
     transcribe.py               chunking, merging, and the segment helpers
@@ -37,10 +37,11 @@ with each chunk's timestamps offset by where that chunk started.
 
 That gives you four failure modes, and they are not equally serious.
 
-**Repetitions** — `loop` (the same line once a second for 20+ seconds),
-`stutter` (a phrase 4+ times inside one segment), `canned` ("Thanks for
-watching", "Subtitles by …"). These are text you *know* is wrong, sitting in a
-window a few seconds to a minute long. Re-decoding them is cheap and almost
+**Repetitions** — `loop` (the same line 3+ times in a row — no duration
+condition, but the typical case is once a second for 20+ seconds), `stutter`
+(a phrase 4+ times inside one segment), `canned` ("Thanks for watching",
+"Subtitles by …"). These are text you *know* is wrong, sitting in a window a
+few seconds to a minute long. Re-decoding them is cheap and almost
 always an improvement. They are the default repair target.
 
 **Gaps** — 5+ seconds that produced no text with speech-level audio underneath.
@@ -109,8 +110,9 @@ Python against `T.load_timestamped`:
 - **Backwards jumps**, counted directly:
   `sum(1 for i in range(1, len(s)) if s[i]["start"] < s[i-1]["start"] - 0.01)`.
   Cross-check each against `T.silence_ends` to see whether it sits on a seam.
-- **Near-duplicate neighbours** that fall under the loop threshold — three
-  identical lines in a row is not flagged but is usually still wrong.
+- **Near-duplicate neighbours** that fall under the loop threshold — two
+  identical lines in a row is not flagged (the detector needs three) but is
+  usually still wrong.
 - **Segments with implausible rates** — a 15-second segment holding four words,
   or one second holding thirty. Both mean the timestamps are not to be trusted
   there.
@@ -118,19 +120,26 @@ Python against `T.load_timestamped`:
   overrun, so a hallucinated ending shows up as content past the real end of
   the audio rather than as a rewind. Compare the last segment's `end` against
   `T.get_duration(audio)`.
-- **Anything the detector calls a gap over loud audio** (peak above about
-  -6 dB). That is not a pause; that is dropped speech and it is worth a listen.
+- **Anything the detector calls a gap.** `gap_is_speech` only checks mean level
+  and silence ratio (`spec/gap-classification.md`, GAP-2) — it never looks at
+  peak or dynamics, so "gap" here just means "not obviously silent," not
+  "obviously speech." Distinguishing dropped speech from applause or room
+  noise past that point is a judgement call: sample the gap in 1-second
+  slices and look at the spread between the quietest and loudest second. Loud
+  and flat (peak > about −28 dB, spread < about 9 dB) reads as applause or
+  everyone talking at once; mid-level with 10–20 dB of spread reads as speech
+  rhythm and is worth a listen. See CLAUDE.md for the fuller triage.
 
 When you want to know what a stretch actually sounds like, measure it rather
-than speculating: `repair.audio_level(audio, start, end)` returns mean dB, peak
-dB and how much of the stretch was silent.
+than speculating: `repair.audio_level(audio, start, end)` returns
+`(mean_db, peak_db, silence_seconds, duration)`.
 
 ## Repairing
 
 Cheapest first, and stop when the transcript stops improving.
 
 1. **Seam trims** — free, no decode, and `repair.py repair` does them
-   automatically at the end of its cycle.
+   automatically first in its cycle, before any window is decoded.
 2. **Targeted windows** — `-w` is repeatable and takes `SS`, `MM:SS` or
    `HH:MM:SS`:
 

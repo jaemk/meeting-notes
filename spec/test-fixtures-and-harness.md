@@ -37,7 +37,9 @@ because the failure output is the first thing read when something breaks.
 
 ## TEST-7
 
-`make test` runs `test_transcribe.py`, `test_repair.py` and `test_readable.py`.
+`make test` runs four suites: `test_transcribe.py`, `test_repair.py`,
+`test_readable.py` and `test_prompt.py`. A new module that renders or writes
+anything a reader sees arrives with its own suite in the same run.
 
 ## TEST-8
 

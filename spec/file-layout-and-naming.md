@@ -27,6 +27,8 @@ The transcript keeps the recording's name: `local/2026-07-25.m4a` writes
 ## FILES-5
 
 A transcription writes three files: `.txt`, `.timestamped.txt` and `.srt`.
+`--no-timestamps` writes the `.txt` alone — which also gives up the only view
+the defects live in, since none of them are visible in the prose.
 
 ## FILES-6
 
@@ -37,9 +39,28 @@ only.
 ## FILES-7
 
 `--output` overrides the stem; `make clean` removes only this recording's
-outputs and leaves the rest of `output/` alone.
+outputs and leaves the rest of `output/` alone. "This recording's outputs" is
+every file the pipeline derives from it: `.txt`, `.timestamped.txt`, `.srt`,
+`.repaired.*`, `.bak`, `.summary.md` and `.readable.md`. A `clean` that leaves
+some of them behind is worse than none, because the next run assembles a
+document from a stale summary.
 
 ## FILES-8
 
 No recording and no transcript ever reaches the repo — not as a fixture, not as
 an example in documentation, not quoted in a code comment.
+
+## FILES-9
+
+The ignore rules match by content type as well as by directory. `local/*` and
+`output/*` cover where the tools write; `*.timestamped.txt`, `*.srt`,
+`*.readable.md`, `*.summary.md`, `*.repaired.*` and `*.bak` cover what the
+files *are*, so a transcript copied or written somewhere else is still not
+committable. The two are deliberately redundant: `FILES-8` is the property that
+matters, and a single directory rule is one `--output` away from being wrong.
+
+## FILES-10
+
+`make distclean` deletes the venv and everything in `output/` — every
+transcript, not just this recording's — so it requires an explicit `CONFIRM=1`.
+Nothing else in the Makefile is destructive beyond one recording.

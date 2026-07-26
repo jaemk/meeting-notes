@@ -54,9 +54,9 @@ than `max(3s, half the window)` uncovered.
 ## REPAIR-10
 
 The best attempt is spliced even when imperfect, and labelled `partial:` in the
-report. `--strict` refuses to splice anything that did not come back clean —
-appropriate for gap windows, where the alternative to bad text is a hole rather
-than worse text.
+report — except an empty one, see `REPAIR-14`. `--strict` refuses to splice
+anything that did not come back clean — appropriate for gap windows, where the
+alternative to bad text is a hole rather than worse text.
 
 ## REPAIR-11
 
@@ -70,3 +70,19 @@ rewound block elsewhere in the file.
 Each pass re-diagnoses the spliced result, so a window that came back with a
 fresh loop is caught by the next pass. Default two passes. Explicit `-w`
 windows are decoded once and not re-derived.
+
+## REPAIR-13
+
+A window that no existing segment overlaps — which is what a `gap` window is —
+still splices in time order. The insert position is found from the window's
+place on the clock, not from the segments it displaced, because there are none
+to displace. Appending it to the end instead produces a transcript whose last
+line is from the middle of the meeting, and every reader and every rewind check
+downstream believes the timestamps.
+
+## REPAIR-14
+
+A decode that comes back with nothing leaves the original text in place. Empty
+is not a repair: splicing it removes real segments and puts nothing where they
+were, turning a window Whisper merely mishandled into a hole. It is reported
+as a failed window and the transcript is left as it was.
