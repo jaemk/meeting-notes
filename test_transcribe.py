@@ -156,6 +156,66 @@ check("kept 3 segments", len(out) == 3, [s['text'] for s in out])
 check("no hole at window edges", T.holes(out, 100.0, 130.0) == [(115.0, 125.0)],
       T.holes(out, 100.0, 130.0))
 check("sorted output", all(out[i]["start"] <= out[i + 1]["start"] for i in range(len(out) - 1)))
+check("a short window is one decode", len(T.window_slices("fake.m4a", 100.0, 130.0, 60)) == 2)
+
+check.section("chunk_boundaries: cut at silence, hard-cut when there is none")
+check("snaps each cut to the nearest silence",
+      T.chunk_boundaries(0, 300, 60, [58, 121, 179], 30) == [0, 58, 121, 179, 239, 300],
+      T.chunk_boundaries(0, 300, 60, [58, 121, 179], 30))
+check("ignores silence outside the tolerance",
+      150 not in T.chunk_boundaries(0, 200, 60, [150], 30),
+      T.chunk_boundaries(0, 200, 60, [150], 30))
+check("never cuts backwards", all(
+    b > a for a, b in zip(*(lambda s: (s[:-1], s[1:]))(
+        T.chunk_boundaries(0, 300, 60, [10, 20, 250], 90)))))
+check("a window barely over one chunk stays whole",
+      T.chunk_boundaries(0, 65, 60, [], 30) == [0, 65])
+
+check.section("a long repair window is sliced like a whole file (stubbed backend)")
+extracts, decoded = [], []
+def fake_extract3(audio, start, dur, out):
+    extracts.append((start, dur)); Path(out).write_text("x")
+def fake_backend3(path, backend, model, lang, cache, cond=True):
+    # A 2s segment at the centre of whatever span was just extracted, so each
+    # slice contributes exactly one segment with its midpoint inside itself.
+    dur = extracts[-1][1]
+    decoded.append(len(decoded) + 1)
+    return {"segments": [{"start": dur / 2 - 1, "end": dur / 2 + 1,
+                          "text": f"slice {len(decoded)}"}]}
+T.extract_chunk, T._run_backend = fake_extract3, fake_backend3
+T.get_duration = lambda p: 3600.0
+T.silence_ends = lambda p, start=None, dur=None: [58.0, 121.0]
+sliced = T.transcribe_window("fake.m4a", (0.0, 180.0), "mlx", "large-v2", "en",
+                             15.0, chunk_mins=1)
+check("180s window became 3 decodes, not 1", len(extracts) == 3, extracts)
+check("cuts landed on the silences",
+      T.window_slices("fake.m4a", 0.0, 180.0, 60) == [0.0, 58.0, 121.0, 180.0],
+      T.window_slices("fake.m4a", 0.0, 180.0, 60))
+points = T.window_slices("fake.m4a", 0.0, 180.0, 60)
+check("no slice runs much past a minute",
+      all(b - a <= 60 + 30 for a, b in zip(points, points[1:])),
+      [b - a for a, b in zip(points, points[1:])])
+# A seam is a hard cut, so no slice can transcribe its neighbour's speech and
+# have both copies spliced in. Only the window's outer edges get context.
+check("internal seams are cut hard, with no padding across them",
+      extracts[1] == (58.0, 121.0 - 58.0), extracts[1])
+check("the last slice is padded on its outer edge only",
+      extracts[2] == (121.0, (180.0 - 121.0) + 15.0), extracts[2])
+check("the first slice's leading pad is clipped at the start of the file",
+      extracts[0] == (0.0, 58.0), extracts[0])
+check("slices tile the window without overlapping",
+      all(a + d <= extracts[i + 1][0] + 0.001
+          for i, (a, d) in enumerate(extracts[:-1])), extracts)
+check("each slice contributed a segment",
+      sorted(s["text"] for s in sliced) == ["slice 1", "slice 2", "slice 3"],
+      [s["text"] for s in sliced])
+check("sliced output stays inside the window",
+      all(0.0 <= s["start"] and s["end"] <= 180.0 for s in sliced), sliced)
+check("sliced output is sorted",
+      all(sliced[i]["start"] <= sliced[i + 1]["start"] for i in range(len(sliced) - 1)))
+extracts.clear()
+T.transcribe_window("fake.m4a", (0.0, 40.0), "mlx", "large-v2", "en", 15.0, chunk_mins=1)
+check("a window inside one chunk is still a single decode", len(extracts) == 1, extracts)
 
 check.section("holes / uncovered_span")
 segs3 = [{"start": 0, "end": 5, "text": "a"}, {"start": 10, "end": 20, "text": "b"}]

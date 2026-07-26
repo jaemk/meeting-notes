@@ -60,16 +60,20 @@ check("defect_windows ignores non-repairable kinds",
 check.section("RepairOptions defaults")
 opts = R.RepairOptions()
 check("defaults to auto backend", opts.backend == "auto", opts.backend)
+check("windows are sliced with the same chunk size as a whole file",
+      opts.chunk_mins == T.DEFAULT_CHUNK_MINS, opts.chunk_mins)
 check("large-v2 with a large-v3 fallback",
       (opts.model, opts.fallback_model) == ("large-v2", "large-v3"))
 check("two passes by default", opts.passes == 2)
 check("overrides apply", R.RepairOptions(model="small", passes=5).model == "small")
 
 check.section("repair with stubbed backend (loop first, then clean)")
-opts = R.RepairOptions(backend="mlx", language="en")
+opts = R.RepairOptions(backend="mlx", language="en", chunk_mins=1)
 attempts = []
-def stub_window(audio, window, backend, model, lang, pad, condition_on_prev=False):
-    attempts.append({"window": window, "model": model, "pad": pad, "cond": condition_on_prev})
+def stub_window(audio, window, backend, model, lang, pad, condition_on_prev=False,
+                chunk_mins=None):
+    attempts.append({"window": window, "model": model, "pad": pad,
+                     "cond": condition_on_prev, "chunk": chunk_mins})
     a, b = window
     if len(attempts) == 1:                      # first try still loops
         return [{"start": a + i, "end": a + i + 1, "text": "loop"} for i in range(int(b - a))]
@@ -80,6 +84,8 @@ windows = R.defect_windows(one_loop, opts.join_within)
 out, report = R.repair("fixture.wav", segs, windows, opts)
 check("escalated past the looping attempt", len(attempts) == 2, len(attempts))
 check("conditioning off on every attempt", all(a["cond"] is False for a in attempts))
+check("the chunk size reaches the decoder on every attempt",
+      all(a["chunk"] == 1 for a in attempts), [a["chunk"] for a in attempts])
 check("second attempt widened pad", attempts[1]["pad"] == 30.0, attempts[1]["pad"])
 check("loop text gone", not any(s["text"] == big.text for s in out))
 check("stub text spliced in", any(s["text"] == "recovered speech" for s in out))
@@ -102,7 +108,8 @@ check("report marks dry-run, not spliced",
 
 check.section("strict mode refuses a bad window")
 attempts.clear()
-def always_loops(audio, window, backend, model, lang, pad, condition_on_prev=False):
+def always_loops(audio, window, backend, model, lang, pad, condition_on_prev=False,
+                 chunk_mins=None):
     attempts.append(1)
     a, b = window
     return [{"start": a + i, "end": a + i + 1, "text": "loop"} for i in range(int(b - a))]
@@ -120,7 +127,8 @@ check.section("diagnose_repair_verify: repair, then re-check")
 synth2 = [{"start": float(i), "end": float(i + 1), "text": "stuck line"} for i in range(30)]
 synth2 += [{"start": 30.0, "end": 33.0, "text": "and then some real speech follows"}]
 decoded = []
-def clean_window(audio, window, backend, model, lang, pad, condition_on_prev=False):
+def clean_window(audio, window, backend, model, lang, pad, condition_on_prev=False,
+                 chunk_mins=None):
     decoded.append(window)
     a, b = window
     return [{"start": a, "end": b, "text": "clean replacement text"}]

@@ -56,6 +56,11 @@ Pass `--no-repair` to keep the raw output, `--repair-model` to re-decode
 defective windows with a different (usually larger) model than the main run,
 and `--repair-passes N` to change how many diagnose/repair rounds it does.
 
+`--chunk-size/-c` governs both halves: it caps the whole-file chunks *and* the
+slices a repair window is decoded in, so the repair pass can never hand Whisper
+a longer stretch than the transcription itself was allowed. `make` uses `-c 1`
+for both.
+
 ## What it looks for
 
 | kind      | what it is                                                        | repaired |
@@ -106,6 +111,11 @@ Notes:
 - Windows accept `SS`, `MM:SS` or `HH:MM:SS`, and `-w` is repeatable.
 - Windows are widened to whole segment boundaries so a segment straddling the
   edge is never cut in half.
+- A window longer than `--chunk-size` is decoded in slices cut at silence, the
+  same way a whole file is chunked — one long decode is what makes Whisper loop
+  in the first place, and a repair window is somewhere it already has. Slices
+  are cut hard at the seam and padded only at the window's outer edges, so
+  neither slice re-transcribes the other's speech.
 - `--pad` seconds (default 15) of surrounding audio are decoded for context and
   then discarded, so the splice stays inside the window.
 - Conditioning on previous text is **off** inside a window — that feedback loop
