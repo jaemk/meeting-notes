@@ -52,34 +52,48 @@ def paragraphs(segments, pause=PARAGRAPH_PAUSE, max_words=PARAGRAPH_WORDS):
     Speakers are not labelled — Whisper does not diarize — so a break at a
     pause is the closest thing to a turn boundary available. It lands on one
     often, because people pause when they hand off, but never assume it did.
+
+    Assumes `segments` is given in the order the transcript should read —
+    this walks it once and never sorts. A transcript still carrying rewinds
+    (see CLAUDE.md — `repair.py repair` leaves them alone when it wasn't
+    given the audio) will not raise here: a backwards jump just fails the
+    `silent >= pause` test and the two stretches land in one paragraph
+    rather than being split apart. Repair the transcript first if that
+    matters; this function only paragraphs what it is handed.
     """
     out, current, start = [], [], None
     previous_end = None
+    words = 0
     for seg in segments:
         text = seg["text"].strip()
         if not text:
             continue
         if current:
             silent = seg["start"] - previous_end
-            words = sum(len(c.split()) for c in current)
             if silent >= pause or words >= max_words:
                 out.append((start, " ".join(current)))
                 current = []
+                words = 0
         if not current:
             start = seg["start"]
         current.append(text)
+        words += len(text.split())
         previous_end = seg["end"]
     if current:
         out.append((start, " ".join(current)))
     return out
 
 
-def render(segments, title, summary=None):
+def render(segments, title, summary=None, paras=None):
     """The whole document: heading, what it is, the summary, the transcript."""
     words = sum(len(s["text"].split()) for s in segments)
+    # Not segments[-1]["end"]: a transcript with an unrepaired rewind (see
+    # `paragraphs` above) does not end at its highest timestamp, so the
+    # running time has to be the max over every segment, not the last one.
+    running = max(s["end"] for s in segments)
     lines = [f"# Meeting transcript — {title}", "",
              f"{len(segments):,} segments · {words:,} words · "
-             f"{fmt_clock(segments[-1]['end'])} running time", ""]
+             f"{fmt_clock(running)} running time", ""]
 
     if summary:
         lines += [summary.strip(), "",
@@ -89,7 +103,9 @@ def render(segments, title, summary=None):
                   "recording.*", ""]
 
     lines += ["---", "", "## Full transcript", ""]
-    for start, body in paragraphs(segments):
+    if paras is None:
+        paras = paragraphs(segments)
+    for start, body in paras:
         lines += [f"**[{fmt_clock(start)}]** {body}", ""]
     return "\n".join(lines)
 
@@ -117,13 +133,18 @@ examples:
     path = T.resolve_transcript(args.transcript)
     if not path.exists():
         sys.exit(f"No transcript at {path}")
-    segments = T.load_timestamped(path)
+    try:
+        segments = T.load_timestamped(path)
+    except ValueError as e:
+        sys.exit(f"Can't read {path}: {e}")
     if not segments:
         sys.exit(f"{path} has no segments")
 
     summary = None
     if args.summary:
-        summary_path = Path(args.summary)
+        # Same lookup as the transcript itself, so a bare name finds it
+        # beside the transcript in output/ instead of only in the cwd.
+        summary_path = T.resolve_transcript(args.summary)
         if not summary_path.exists():
             sys.exit(f"No summary at {summary_path}")
         summary = summary_path.read_text().strip()
@@ -132,12 +153,14 @@ examples:
 
     stem = T.output_stem(path)
     title = args.title or document_title(stem)
-    out = Path(args.output) if args.output else Path(f"{stem}.readable.md")
+    # Same rule as everything else this repo writes: a bare name lands in
+    # output/, a path with a directory in it is used as given.
+    out = T.resolve_output(args.output) if args.output else Path(f"{stem}.readable.md")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render(segments, title, summary))
+    paras = paragraphs(segments)
+    out.write_text(render(segments, title, summary, paras=paras))
 
-    count = len(paragraphs(segments))
-    print(f"Saved: {out}  ({count} paragraphs"
+    print(f"Saved: {out}  ({len(paras)} paragraphs"
           f"{', with summary' if summary else ', no summary'})")
 
 

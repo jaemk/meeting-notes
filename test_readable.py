@@ -1,4 +1,5 @@
-from testlib import Checks, FIXTURE
+import sys
+from testlib import Checks, FIXTURE, OUTPUT_DIR
 import transcribe as T
 import readable as Rd
 
@@ -77,5 +78,74 @@ check("and is labelled as machine-written, since it is",
 check("the transcript survives the summary being added",
       with_summary.split("## Full transcript")[1] ==
       doc.split("## Full transcript")[1])
+
+check.section("a caller-supplied paragraph list is used, not recomputed")
+custom_paras = [(0.0, "totally custom body text")]
+custom_doc = Rd.render(real, "2026-07-25", paras=custom_paras)
+check("the document's transcript came from the paragraphs passed in",
+      "totally custom body text" in custom_doc and
+      custom_doc.count("**[") == 1, custom_doc.count("**["))
+check("render still paragraphs for itself when nothing is passed",
+      Rd.render(real, "2026-07-25").count("**[") == len(Rd.paragraphs(real)))
+
+check.section("running time survives a rewind")
+# A chunk that overran its seam and was merged verbatim (repair.py leaves
+# this alone unless it has the audio — see CLAUDE.md) puts a segment near
+# the end of the list whose own end is far short of the transcript's real
+# extent. The reproduction from the finding: three segments, last one
+# ending at 5:10, actual extent is 10:00.
+rewound = [
+    {"start": 0.0, "end": 300.0, "text": "first chunk covers the first five minutes"},
+    {"start": 305.0, "end": 600.0, "text": "second chunk runs on to the real end"},
+    {"start": 295.0, "end": 310.0, "text": "first chunk's overrun tail, stamped before the seam"},
+]
+rewound_doc = Rd.render(rewound, "rewind-case")
+check("the header reports the transcript's real extent, not the last segment's",
+      "0:10:00 running time" in rewound_doc, rewound_doc.split("\n")[2])
+check("not the pre-fix answer, which stopped at the last segment's own end",
+      "0:05:10 running time" not in rewound_doc)
+check("paragraphs() itself doesn't raise on a backwards jump",
+      len(Rd.paragraphs(rewound)) >= 1, Rd.paragraphs(rewound))
+
+check.section("main()'s file lookups and error handling")
+transcript_name = "readable-cli-test.timestamped.txt"
+summary_name = "readable-cli-test.summary.md"
+output_name = "readable-cli-test.readable.md"
+(OUTPUT_DIR / transcript_name).write_text(
+    "[00:00:00.00 --> 00:00:02.00]  hello there\n"
+    "[00:00:02.00 --> 00:00:04.00]  general kenobi\n"
+)
+(OUTPUT_DIR / summary_name).write_text("## Executive summary\n\nIt happened.\n")
+
+
+def run_main(argv):
+    old_argv = sys.argv
+    sys.argv = ["readable.py"] + argv
+    try:
+        Rd.main()
+        return None
+    except SystemExit as e:
+        return e.code
+    finally:
+        sys.argv = old_argv
+
+
+exit_code = run_main([transcript_name, "--summary", summary_name, "-o", output_name])
+check("a bare --summary name resolves in output/, same as the transcript",
+      exit_code is None, exit_code)
+check("a bare --output name is also written into output/, not the cwd",
+      (OUTPUT_DIR / output_name).exists(), OUTPUT_DIR / output_name)
+if (OUTPUT_DIR / output_name).exists():
+    check("the resolved summary made it into the document",
+          "It happened." in (OUTPUT_DIR / output_name).read_text())
+
+bad_name = "readable-cli-test-malformed.timestamped.txt"
+(OUTPUT_DIR / bad_name).write_text("this line has no timestamp at all\n")
+bad_exit = run_main([bad_name])
+check("a malformed transcript line exits cleanly instead of raising ValueError",
+      isinstance(bad_exit, str), bad_exit)
+if isinstance(bad_exit, str):
+    check("the clean error names the file that failed to parse",
+          bad_name in bad_exit, bad_exit)
 
 check.finish()
