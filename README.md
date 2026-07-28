@@ -1,8 +1,40 @@
 # meeting-notes
 
-Whisper transcription that cleans up after itself. Long recordings are split at
-silence boundaries to avoid Whisper's repetition bug, and whatever gets through
-anyway is found and re-transcribed automatically before you ever see it.
+Turn a recording of a meeting into a document someone can act on: an executive
+summary with owners and follow-ups, over a timestamped transcript marked with
+who was speaking.
+
+Whisper on its own does not survive a two-hour recording — it conditions on its
+own output and gets stuck repeating itself, drops speech it cannot hear, and
+invents endings for chunks whose audio has run out. So this splits long audio
+at silence boundaries, then finds and re-transcribes its own defects before you
+ever see them.
+
+The other half of the design is **declining to guess**. A speaker left
+unnamed, a gap reported rather than filled, a figure flagged as inconsistent —
+these are correct outputs, not shortfalls. A wrong name or an invented number
+that a reader cannot detect is worse than an obvious absence.
+
+Nothing here is specific to one group or one meeting. It wants a single audio
+file of people talking.
+
+## Quick start
+
+    ./setup.sh                                    # once — builds .venv
+    cp ~/somewhere/meeting.m4a local/
+    make transcribe INPUT=local/meeting.m4a       # hours; the long step
+    make check      INPUT=local/meeting.m4a       # free; read what is left
+    make readable   INPUT=local/meeting.m4a       # the deliverable
+
+That produces `output/meeting.readable.md`. Everything else on this page is
+optional: who was speaking (`make diarize`), putting names to them
+(`make names`), and correcting proper nouns the decoder mishears
+(`local/glossary.txt`).
+
+Two of those steps cost real time — see [What a run costs](#what-a-run-costs)
+before starting a long recording. If you would rather not think about the
+order, `make pipeline INPUT=local/meeting.m4a` runs every step without
+stopping, but it skips the two places a person is supposed to look.
 
 ## What you need first
 
@@ -21,8 +53,22 @@ anyway is found and re-transcribed automatically before you ever see it.
   `FileNotFoundError` partway into a long run.
 - **Room for the model weights**, which are *not* downloaded during setup — see
   [What a run costs](#what-a-run-costs).
-- The `claude` CLI, for `make analyze` and `make readable` only. Everything
-  else runs offline once the weights are cached.
+- The **`claude` CLI**, for `make analyze`, `make names` and the summary half
+  of `make readable`. Everything else runs offline once the weights are
+  cached, and `make readable NO_SUMMARY=1` gives you the assembled transcript
+  without it.
+
+Optional, and deliberately not installed by `setup.sh`:
+
+- **Speaker diarization** — `pip install -r requirements-diarize.txt`, plus a
+  Hugging Face account. 65 packages and 1–2 GB for a feature the transcription
+  pipeline does not need, so someone who only wants transcripts does not pay
+  for it. See [Who was speaking](#who-was-speaking).
+
+Everything degrades cleanly. Without the `claude` CLI you get transcripts and
+a formatted document; without diarization you get an unlabelled one; without
+either you still get the part that takes hours and cannot be redone without
+the audio.
 
 ## Setup
 
@@ -63,7 +109,7 @@ you wait on. Four things are worth knowing before the first one.
 **Wall clock.** Decoding is slower than the recording on a CPU and faster than
 it on Apple Silicon, and the gap between the two is enormous — an order of
 magnitude, not a few percent. For a 2½-hour recording at the settings `make`
-uses (`--model large-v2 -c 1`):
+uses (`--model large-v2 -c 5`):
 
 - **Apple Silicon, mlx backend** (what `--backend auto` picks there): hours,
   not minutes. Start it before lunch.
@@ -73,10 +119,21 @@ uses (`--model large-v2 -c 1`):
   six times faster than realtime. Plan an overnight run, or take a draft from
   `--model small`.
 
-`-c 1`, which `make` passes, is a deliberate trade: 1-minute chunks are what
-stops Whisper looping, but they turn a 2½-hour recording into ~150 separate
-`ffmpeg` extractions, each of which seeks by decoding from the start of the
-file. The default `-c 5` is quicker and loops more.
+**Chunk size is not the loop knob it looks like.** `make` used to pass `-c 1`
+on the theory that shorter chunks loop less. Measured across `-c 1`, `2`, `3`,
+`5` and `10` on the worst 30 minutes of a real recording, loops came back 4,
+8, 5, 3 and 3 — no trend. Loops start a mean 46% of the way into their chunk
+and cluster by position in the *recording*, not the chunk: they are a decoder
+failure on hard audio, and a shorter chunk cannot reach them. So `make` now
+passes `-c 5`, which is faster (one-minute chunks turn a 2½-hour recording
+into ~150 separate `ffmpeg` extractions, each seeking from the start of the
+file), cuts on silence more often, and keeps a 2× margin under the ten minutes
+where conditioning really does take over. See `spec/chunked-transcription.md`,
+CHUNK-7 … CHUNK-12.
+
+`FIX_ARGS` still passes `-c 1`, and that is not an inconsistency: a repair
+window is already about a minute, so there `-c 1` means "do not sub-chunk
+this" rather than "keep the decode short".
 
 The automatic repair pass at the end is the cheap part, and the only part with
 published numbers here: on a 2½-hour meeting it was 12 decode windows and 182
@@ -115,6 +172,32 @@ repo. A bare filename on the command line is looked up in the directory that
 kind of file belongs to, so `transcribe.py 2026-07-25.m4a` finds
 `local/2026-07-25.m4a` and `repair.py verify 2026-07-25.timestamped.txt` finds
 it in `output/`. Anything with a directory component is used as given.
+
+**Nothing from a meeting is committable, wherever it lands.** Ignoring the two
+directories is not enough on its own — a file written somewhere else by a
+`--output` flag, or dropped in the repo root by hand, would otherwise be fair
+game. So `.gitignore` also matches by what a file *is*: every audio and video
+extension, `.timestamped.txt`/`.srt`/`.readable.md`/`.summary.md`/`.repaired.*`,
+and the four sidecars below. If you add a stage that writes something new,
+add its pattern too.
+
+The sidecars deserve naming, because they are more identifying than the
+transcript and much easier to send to someone by accident:
+
+    NAME.speakers.json          which stretches are the same voice
+    NAME.names.json             which voice is which real person
+    NAME.names-candidates.json  every name-like mention, with the
+                                surrounding conversation quoted around it
+    local/glossary.txt          the real spellings of local names
+
+`names-candidates.json` is the one to be careful with: it is a few hundred KB
+of names and quoted context, which is a larger disclosure than the full
+transcript in a far more convenient package.
+
+To check the rules are still doing their job:
+
+    git check-ignore -v local/x.m4a output/x.names.json glossary.txt
+    git status --porcelain --untracked-files=all   # nothing from a meeting here
 
 **The transcript keeps the recording's name.** `local/2026-07-25.m4a` writes
 `output/2026-07-25.txt`, `output/2026-07-25.timestamped.txt` and
@@ -168,22 +251,22 @@ before the transcription starts rather than after it.
 
 `--chunk-size/-c` governs both halves: it caps the whole-file chunks *and* the
 slices a repair window is decoded in, so the repair pass can never hand Whisper
-a longer stretch than the transcription itself was allowed. `make` uses `-c 1`
-for both.
+a longer stretch than the transcription itself was allowed. `make` uses `-c 5`
+for the transcription and `-c 1` for repair windows.
 
 **`ARGS` is how you pass any of that through `make`**, and it is a
 *replacement*, not an addition:
 
-    ARGS ?= --model large-v2 -c 1 -l en        # the Makefile's default
+    ARGS ?= --model large-v2 -c 5 -l en        # the Makefile's default
 
-    make transcribe INPUT=local/audio.m4a ARGS="--model large-v3 -c 1 -l en"
+    make transcribe INPUT=local/audio.m4a ARGS="--model large-v3 -c 5 -l en"
 
-Setting `ARGS` discards that default wholesale, including `-c 1`. `make
-transcribe ARGS="--backend openai"` does not mean "the usual settings, on the
-CPU" — it means `--model medium`, the language auto-detected, and 5-minute chunks,
-which is the long-decode condition the chunking exists to avoid. Restate every
-flag you still want. The same applies to `FIX_ARGS` for `make fix` (below),
-which defaults to exactly the same string.
+Setting `ARGS` discards that default wholesale. `make transcribe
+ARGS="--backend openai"` does not mean "the usual settings, on the CPU" — it
+means `--model medium` and the language auto-detected, which is slower and
+less accurate than what you thought you asked for. Restate every flag you
+still want. The same applies to `FIX_ARGS` for `make fix` (below), which
+defaults to `--model large-v2 -c 1 -l en`.
 
 ## What it looks for
 
@@ -316,9 +399,118 @@ Notes:
   then with `--fallback-model`. `--strict` refuses to splice anything that does
   not come back completely clean.
 
+## Who was speaking
+
+Optional, and the one feature with an install of its own.
+
+    make diarize  INPUT=local/2026-07-25.m4a   # once per recording
+    make speakers INPUT=local/2026-07-25.m4a   # render it standalone, instant
+
+Whisper does not identify speakers. `diarize.py` runs
+`pyannote/speaker-diarization-3.1` over the audio and writes
+`output/NAME.speakers.json` — a sidecar saying which stretches are the same
+voice, without knowing whose. `make readable SPEAKERS=1` then marks the
+transcript up with cluster numbers.
+
+**It costs about a tenth of the recording's length** (12.8 minutes for a
+150-minute meeting on an M4) and needs a separate install plus a Hugging Face
+account:
+
+    .venv/bin/pip install -r requirements-diarize.txt
+
+Read that file's header before you do — it is 65 packages and 1–2 GB, and the
+Hugging Face side has three steps pip cannot do for you (accept the model
+conditions on your *account*, create a read token, `.venv/bin/hf auth login`).
+It also records two upstream incompatibilities that will otherwise cost you an
+afternoon. Nothing else in the project imports it, so skipping this is a
+supported configuration rather than a broken one.
+
+`diarize` is the expensive half and runs once per recording; `speakers`
+re-renders from the sidecar for free.
+
+**Labels are cluster numbers, never names**, and a paragraph attributed to two
+speakers spans a hand-off — it holds words from each, and what is unknown is
+where one stops, not who was there. Do not sweep `--contested-ratio` looking
+for a better value: it was derived twice, and every band from 0.3 to 0.9
+scores the same, because cluster onset error is larger than a transcript
+segment.
+
+## Putting names to the voices
+
+    make names INPUT=local/2026-07-25.m4a
+
+Meetings name their own participants — people introduce themselves and address
+each other all the way through. `names.py gather` collects every name-like
+mention with its context (free, mechanical, deliberately over-inclusive), hands
+them to Claude with `naming.md`, and validates the answer into
+`output/NAME.names.json`.
+
+The validation is the point of the step. It refuses a cluster the recording
+does not have, and any evidence quote that does not appear in the transcript
+word for word — so a name has to rest on something that was actually said. It
+does **not** make a name right: a real quote pinned to the wrong cluster still
+passes, which is why every name carries its evidence and its confidence.
+
+**Expect most clusters to stay anonymous.** That is the designed outcome.
+Report coverage as a share of *speech* rather than of clusters — the largest
+ten clusters usually hold about 80% of what was said, so naming a handful of
+them covers most of the meeting.
+
+`make readable NAMES=1` renders them as `Name (Speaker 7)`, keeping the cluster
+number beside each name so a wrong one can be traced back.
+
+## Proper nouns the decoder cannot know
+
+Whisper spells unfamiliar names phonetically, and does it *consistently* —
+which is what makes it dangerous. A place name wrong the same way on every page
+reads as authoritative, and nothing upstream catches it: the repair loop finds
+loops, rewinds and gaps, and a misspelled name is none of those. The audio does
+not distinguish a wrong spelling from a right one either, so no measurement
+settles it. The only source of truth is a person who knows the name.
+
+Write them down once, in `local/glossary.txt`:
+
+    # <correct spelling>: <variant>, <variant>, ...
+    Wren Ashby: Ren Ashbee, Wren Ashbee
+    Thornbury Cove: Thornberry Cove, Thorn Bury Cove
+
+Left of the colon is the spelling you want; right of it are the spellings the
+transcript actually contains. Matching ignores case and is anchored to word
+boundaries, so a short entry never rewrites the inside of an unrelated word.
+
+`make readable` applies it automatically — **having a glossary is the request
+to use it**, because a switch you can forget to set produces exactly the
+silently-wrong document this exists to prevent. `GLOSSARY=` turns it off for a
+run; `GLOSSARY=<file>` names one explicitly.
+
+Check one before trusting it:
+
+    .venv/bin/python glossary.py local/glossary.txt --against output/NAME.repaired.timestamped.txt
+
+That reports what it would correct **and which entries never matched**. The
+second half is the useful one: an entry that never fires is either a spelling
+the decoder never produced or one you typed wrong, and those are
+indistinguishable until something goes looking. Expect to find variants in
+passes — apply what you know, re-render, and read what the summary still flags.
+
+Two rules:
+
+- **It never edits the transcript.** `.timestamped.txt`, `.srt` and `.txt`
+  keep what the decoder wrote, because they are the audit trail back to the
+  audio. Corrections are applied when a document is rendered, and the document
+  says a glossary was applied and names every word it changed.
+- **Never add a spelling you are guessing at.** A glossary entry is a name.
+  Two inconsistent spellings are better than one that is consistently wrong,
+  because a reader can see an inconsistency and cannot see an error.
+
+A glossary is nothing but real names, so keep it in `local/`, which is
+gitignored.
+
 ## The document a person reads
 
     make readable                    summarise with Claude, then assemble
+    make readable SPEAKERS=1         label who is speaking (needs make diarize)
+    make readable NAMES=1            and name them (needs make names)
     make readable NO_SUMMARY=1       transcript only — no Claude, no cost
     make readable SUMMARY_PROMPT=<f> ask for a different summary
 
@@ -336,10 +528,24 @@ regenerated without rebuilding the transcript — and so a bad summary is obviou
 rather than buried in the middle of a 23,000-word file. `readable.py` runs on
 its own if you only want the formatting.
 
+`NAMES=1` implies `SPEAKERS=1` — a name is put to a cluster, so there has to
+be one. Neither flag gives the plain document.
+
+**The summary is written from the document, not from the raw transcript.**
+`make readable` pipes `readable.py --transcript-only` into Claude, so the
+summariser sees the same paragraphs, the same speaker labels and the same
+`[H:MM:SS]` anchors the reader will. That is what stops it describing an
+unlabelled transcript directly above a labelled one, and what makes the
+timestamps it cites land on headings that actually exist — before the pipe, 4
+out of 5 of them pointed at nothing.
+
 `summarize.md` is worth reading before you trust the output. It tells Claude
-what the transcript is — machine-generated, single microphone, speakers not
-labelled — and to flag uncertainty rather than fill gaps, which is the
-difference between a summary you can act on and one that invents a number.
+what the transcript is — machine-generated, single microphone, speakers
+labelled only if a diarization pass ran — and to flag uncertainty rather than
+fill gaps, which is the difference between a summary you can act on and one
+that invents a number. In particular it is told that a figure stated once and
+revised a minute later means take the last one **and say the earlier ones
+disagreed**, rather than silently picking a number.
 
 ## Asking Claude to look at it
 
@@ -366,16 +572,22 @@ Requires the `claude` CLI on `PATH` (`CLAUDE=` to point elsewhere).
 
     make test
 
-Four suites — `test_transcribe.py`, `test_repair.py`, `test_readable.py` and
-`test_prompt.py` — share the harness in `testlib.py`, which also builds both
+Seven suites — `test_transcribe.py`, `test_repair.py`, `test_readable.py`,
+`test_prompt.py`, `test_diarize.py`, `test_names.py` and `test_glossary.py`,
+812 checks in total — share the harness in `testlib.py`, which also builds both
 fixtures into `output/`: a synthetic transcript with a known loop, rewind and
 gap planted in neutral filler, and thirty seconds of ffmpeg-generated
 tone/silence for the gap classifier. Nothing depends on a recording, so a fresh
 clone runs the whole suite — and every number the tests assert is a property of
 the generator rather than of somebody's meeting.
 
-Decoding is stubbed throughout, so it finishes in seconds. The only thing that
-can skip is the audio-backed gap classification, if `ffmpeg` is not installed.
+Check names read as sentences about behaviour rather than as function names,
+because the suite doubles as the description of what each part promises.
+
+Decoding is stubbed throughout, so it finishes in seconds — and the speaker
+suites do not need the optional diarization install either. The only thing
+that can skip is the audio-backed gap classification, if `ffmpeg` is not
+installed.
 
 ## What is written down where
 
@@ -389,5 +601,11 @@ can skip is the audio-backed gap classification, if `ffmpeg` is not installed.
   side of a seam is lying, what each defect kind costs, what not to do.
 - **`summarize.md`** — what Claude is told about the transcript before it
   summarises it.
-- **`CLAUDE.md`** — how to work on this repo, and what has already been tried
-  and did not work.
+- **`naming.md`** — how Claude is told to weigh evidence when putting names to
+  voices, and why returning almost nothing is the correct answer.
+- **`CLAUDE.md`** — the purpose of the project, how it is driven, and what has
+  already been tried and did not work. Read it before changing anything: most
+  of it is measurements that rule out an approach which sounds obvious.
+- **`.claude/skills/transcribe/`** — the running order as a Claude Code skill,
+  which stops at the two points where a person has to look. The `make` targets
+  work the same way without it.

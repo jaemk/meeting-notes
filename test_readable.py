@@ -1,3 +1,4 @@
+import pathlib
 import sys
 from testlib import Checks, FIXTURE, OUTPUT_DIR
 import transcribe as T
@@ -39,6 +40,44 @@ check("blank text is skipped rather than breaking the paragraph",
       Rd.paragraphs(holes))
 check("a transcript of nothing but blanks yields no paragraphs",
       Rd.paragraphs([{"start": 0.0, "end": 1.0, "text": ""}]) == [])
+
+check.section("speaker labels break a paragraph where a pause would not")
+turn_segs = [{"start": 0.0, "end": 2.0, "text": "asking the question"},
+             {"start": 2.1, "end": 4.0, "text": "and finishing it"},
+             {"start": 4.1, "end": 6.0, "text": "answering it"}]
+plain = Rd.paragraphs(turn_segs)
+marked = Rd.paragraphs(turn_segs, labels=["Speaker 1", "Speaker 1", "Speaker 2"])
+check("without labels the three run together, since nobody paused",
+      len(plain) == 1, plain)
+check("with labels the change of speaker splits them",
+      len(marked) == 2, marked)
+check("and each paragraph carries the label it belongs to",
+      [p[2] for p in marked] == ["Speaker 1", "Speaker 2"], marked)
+check("the words are unchanged by labelling",
+      " ".join(p[1] for p in marked) == plain[0][1], marked)
+check("an unlabelled paragraph reports None rather than inventing a speaker",
+      plain[0][2] is None, plain[0])
+check("a pause still breaks inside one speaker's own run",
+      len(Rd.paragraphs(segs, labels=["Speaker 1"] * 4)) == 2,
+      Rd.paragraphs(segs, labels=["Speaker 1"] * 4))
+check("labels are indexed by segment, so a blank segment does not shift them",
+      [p[2] for p in Rd.paragraphs(holes, labels=["A", "B", "A"])] == ["A"],
+      Rd.paragraphs(holes, labels=["A", "B", "A"]))
+
+check.section("a labelled document says the labels are not names")
+labelled_doc = Rd.render(turn_segs, "meeting", paras=marked)
+check("each speaker's paragraph is attributed in the body",
+      "Speaker 1 — asking" in labelled_doc and "Speaker 2 — answering" in labelled_doc,
+      labelled_doc)
+check("the document warns that a label is a cluster, not a person",
+      "not names" in labelled_doc)
+check("an unlabelled document makes no such claim, having made no labels",
+      "not names" not in Rd.render(turn_segs, "meeting"))
+check("the summary note tracks whether speakers were labelled",
+      "acoustic clusters, not names" in
+      Rd.render(turn_segs, "meeting", "It happened.", paras=marked)
+      and "speakers are not labelled" in
+      Rd.render(turn_segs, "meeting", "It happened."))
 
 check.section("the clock is written for reading, not sorting")
 check("hours are unpadded and minutes and seconds are",
@@ -138,6 +177,183 @@ check("a bare --output name is also written into output/, not the cwd",
 if (OUTPUT_DIR / output_name).exists():
     check("the resolved summary made it into the document",
           "It happened." in (OUTPUT_DIR / output_name).read_text())
+
+check.section("--speakers on the command line")
+speakers_name = "readable-cli-test.speakers.json"
+# Removed rather than assumed absent: the run below writes it, so leaving it
+# in place makes this check pass on a first run and fail on every later one.
+(OUTPUT_DIR / speakers_name).unlink(missing_ok=True)
+missing_exit = run_main([transcript_name, "--speakers", "-o", output_name])
+check("with no sidecar anywhere it says so instead of rendering unlabelled",
+      isinstance(missing_exit, str) and "diarize.py run" in missing_exit,
+      missing_exit)
+
+(OUTPUT_DIR / speakers_name).write_text(
+    '{"turns": [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"},'
+    ' {"start": 2.0, "end": 4.0, "speaker": "SPEAKER_01"}]}')
+spk_exit = run_main([transcript_name, "--speakers", "-o", output_name])
+check("a bare --speakers finds the sidecar beside the transcript",
+      spk_exit is None, spk_exit)
+if (OUTPUT_DIR / output_name).exists():
+    spk_doc = (OUTPUT_DIR / output_name).read_text()
+    check("both planted voices are named in the rendered document",
+          "Speaker 0" in spk_doc and "Speaker 1" in spk_doc, spk_doc)
+    check("the transcript's own words are still all present",
+          "hello there" in spk_doc and "general kenobi" in spk_doc)
+
+named_exit = run_main([transcript_name, "--speakers", speakers_name,
+                       "-o", output_name])
+check("naming the sidecar explicitly works the same way",
+      named_exit is None, named_exit)
+bad_sidecar = "readable-cli-test.badspeakers.json"
+(OUTPUT_DIR / bad_sidecar).write_text("{not json")
+bad_side_exit = run_main([transcript_name, "--speakers", bad_sidecar,
+                          "-o", output_name])
+check("an unreadable sidecar is refused rather than silently dropped",
+      isinstance(bad_side_exit, str) and "Can't read" in bad_side_exit,
+      bad_side_exit)
+
+no_spk_exit = run_main([transcript_name, "-o", output_name])
+check("without --speakers the sidecar is ignored even when it is sitting there",
+      no_spk_exit is None
+      and "Speaker 0" not in (OUTPUT_DIR / output_name).read_text())
+
+check.section("--transcript-only is the summariser's view of the document")
+# The wiring this protects: the summary used to be written from the raw
+# .timestamped.txt while the document below it carried speakers and names, so
+# the summariser announced "this transcript is not diarized" above a diarized
+# transcript and cited timestamps that matched no heading in the finished file.
+# Both halves now render through transcript_lines, so they cannot disagree.
+segs_two = [{"start": 0.0, "end": 2.0, "text": "hello there"},
+            {"start": 2.0, "end": 4.0, "text": "general kenobi"}]
+lab_paras = Rd.paragraphs(segs_two, labels=["Robin (Speaker 0)", "Speaker 1"])
+only = "\n".join(Rd.transcript_lines(lab_paras))
+doc_with = Rd.render(segs_two, "t", summary="## Executive summary\n\nx",
+                     paras=lab_paras)
+
+check("every line it emits appears verbatim in the assembled document",
+      all(ln in doc_with for ln in only.splitlines() if ln.strip()), only)
+check("it carries the speaker labels, so the summariser can see who spoke",
+      "Robin (Speaker 0)" in only and "Speaker 1" in only, only)
+check("it carries the same [H:MM:SS] anchors the document headings use",
+      "**[0:00:00]**" in only and "**[0:00:02]**" in only, only)
+check("it stops at the transcript — no heading, no summary, no notes",
+      "# Meeting transcript" not in only
+      and "Executive summary" not in only
+      and "pyannote" not in only, only)
+
+# The reason the pipe in `make readable` is safe: stdout is the transcript and
+# only the transcript, so a progress line cannot end up inside the summary.
+import io
+from contextlib import redirect_stdout
+
+buf = io.StringIO()
+with redirect_stdout(buf):
+    to_exit = run_main([transcript_name, "--speakers", speakers_name,
+                        "--transcript-only"])
+piped = buf.getvalue()
+check("--transcript-only exits cleanly", to_exit is None, to_exit)
+check("it writes the transcript to stdout, ready to pipe into the summariser",
+      "hello there" in piped and "general kenobi" in piped, piped)
+check("and writes nothing else there — no 'Saved:' line to corrupt the pipe",
+      "Saved:" not in piped, piped)
+check("the labels from the sidecar reach stdout too",
+      "Speaker 0" in piped and "Speaker 1" in piped, piped)
+
+# --summary opens a document; --transcript-only builds no document. Honouring
+# either one silently would hide that the other was ignored.
+clash = run_main([transcript_name, "--transcript-only",
+                  "--summary", summary_name])
+check("asking for a summary and no document at once is refused, not guessed",
+      isinstance(clash, str) and "--transcript-only" in clash, clash)
+
+before = (OUTPUT_DIR / output_name).read_text()
+with redirect_stdout(io.StringIO()):
+    run_main([transcript_name, "--transcript-only", "-o", output_name])
+check("it never writes the document, so a summary pass cannot clobber one",
+      (OUTPUT_DIR / output_name).read_text() == before)
+
+check.section("a reader that stops early closes the pipe, it does not crash")
+# `--transcript-only` is built to be piped, so the reader going away first is
+# ordinary, not exceptional: `| head` while eyeballing it, or a summariser that
+# dies on its first read. Without the devnull redirect this printed a
+# BrokenPipeError traceback and then a second "Exception ignored" during
+# interpreter shutdown.
+#
+# Deliberately not the shared fixture: it renders to about 10KB, which fits
+# inside the 64KB pipe buffer, so the write would succeed and the test would
+# pass without ever breaking a pipe. This transcript is sized past the buffer
+# so the EPIPE is the point of the test rather than a coincidence of timing.
+import subprocess
+
+big_name = "readable-pipe-test.timestamped.txt"
+big_path = OUTPUT_DIR / big_name
+big_path.write_text("".join(
+    f"[{i // 3600:02d}:{i // 60 % 60:02d}:{i % 60:02d}.00 --> "
+    f"{i // 3600:02d}:{i // 60 % 60:02d}:{i % 60:02d}.99]  "
+    + "a much longer line of transcript text to push past the buffer\n"
+    for i in range(2000)))
+rendered = subprocess.run(
+    [sys.executable, "readable.py", str(big_path), "--transcript-only"],
+    capture_output=True, text=True)
+check("the oversized transcript really does exceed a 64KB pipe buffer",
+      len(rendered.stdout.encode()) > 65536, len(rendered.stdout.encode()))
+
+piped_run = subprocess.run(
+    f"{sys.executable} readable.py {big_path} --transcript-only | head -c 1",
+    shell=True, capture_output=True, text=True)
+check("a closed pipe prints no traceback",
+      "BrokenPipeError" not in piped_run.stderr
+      and "Traceback" not in piped_run.stderr, piped_run.stderr)
+check("and no 'Exception ignored' from the flush on the way out",
+      "Exception ignored" not in piped_run.stderr, piped_run.stderr)
+check("the reader still got the start of the transcript",
+      piped_run.stdout.startswith("*"), piped_run.stdout[:40])
+
+check("writing to a live stream is unaffected",
+      (lambda b: (Rd.write_piped("kept", b), b.getvalue())[1])(io.StringIO())
+      == "kept")
+
+check.section("--glossary corrects the document without touching the transcript")
+# The point of applying corrections here rather than in the summary and the
+# document separately: both come from these paragraphs, so a name cannot be
+# spelled one way in the summary and another way in the transcript below it.
+gloss_name = str(OUTPUT_DIR / "readable-cli-test.glossary.txt")
+pathlib.Path(gloss_name).write_text("General Kenobi: general kenobi\n")
+
+buf = io.StringIO()
+with redirect_stdout(buf):
+    g_exit = run_main([transcript_name, "--glossary", gloss_name,
+                       "--transcript-only"])
+g_piped = buf.getvalue()
+check("--glossary exits cleanly", g_exit is None, g_exit)
+check("the summariser's copy is corrected, so the summary spells it right",
+      "General Kenobi" in g_piped, g_piped)
+
+g_doc_out = "readable-glossary-test.readable.md"
+run_main([transcript_name, "--glossary", gloss_name, "-o", g_doc_out])
+g_doc = (OUTPUT_DIR / g_doc_out).read_text()
+check("the assembled document is corrected the same way",
+      "General Kenobi" in g_doc, g_doc)
+check("the document says a glossary was applied, and names what changed",
+      "Spellings corrected" in g_doc and "General Kenobi" in g_doc, g_doc)
+check("the transcript file itself is left exactly as the decoder wrote it",
+      "general kenobi" in (OUTPUT_DIR / transcript_name).read_text()
+      and "General Kenobi" not in (OUTPUT_DIR / transcript_name).read_text())
+check("a document built without a glossary carries no correction note",
+      "Spellings corrected" not in
+      (run_main([transcript_name, "-o", g_doc_out]),
+       (OUTPUT_DIR / g_doc_out).read_text())[1])
+
+bad_gloss = str(OUTPUT_DIR / "readable-cli-test-bad.glossary.txt")
+pathlib.Path(bad_gloss).write_text("no colon on this line\n")
+g_bad = run_main([transcript_name, "--glossary", bad_gloss, "-o", g_doc_out])
+check("a malformed glossary is refused rather than silently skipped",
+      isinstance(g_bad, str) and "Refusing this glossary" in g_bad, g_bad)
+g_missing = run_main([transcript_name, "--glossary", "no-such-glossary.txt",
+                      "-o", g_doc_out])
+check("naming a glossary that is not there is an error, not a no-op",
+      isinstance(g_missing, str) and "No glossary at" in g_missing, g_missing)
 
 bad_name = "readable-cli-test-malformed.timestamped.txt"
 (OUTPUT_DIR / bad_name).write_text("this line has no timestamp at all\n")

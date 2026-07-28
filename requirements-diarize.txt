@@ -1,0 +1,86 @@
+# OPTIONAL. Speaker diarization only. `setup.sh` does not install this, and
+# nothing in transcribe.py, repair.py, readable.py or the test suite imports it.
+# Install deliberately, only if you want speaker attribution:
+#
+#   .venv/bin/pip install -r requirements-diarize.txt
+#
+# It is kept out of requirements.txt because it costs 65 packages and 1-2 GB
+# (torchaudio, lightning, matplotlib, pandas, scikit-learn, speechbrain) for a
+# feature the transcription pipeline does not need. Someone who only wants
+# transcripts should not pay for it.
+#
+# WHY THIS AND NOT AUDIO FEATURES: pitch and level were measured on a real
+# 150-minute recording and cannot mark turns — see spec/speaker-attribution.md,
+# SPEAKER-5 ... SPEAKER-12. SPEAKER-13 ... SPEAKER-15 is the case for this.
+#
+# VERIFIED against Python 3.9.6, macOS arm64/Apple Silicon, on the venv
+# recorded in requirements.txt. The resolution was checked to add packages
+# only: torch (2.8.0), numpy (2.0.2) and scipy (1.13.1) were already satisfied
+# and were NOT upgraded, and no pre-existing package changed version or was
+# removed. That matters more than it sounds — pyannote depends on torch, and a
+# resolver that decided to move torch would silently re-roll the Whisper
+# backends both transcribe.py and the mlx path rely on. After installing,
+# confirm the same:
+#
+#   .venv/bin/pip freeze  (diff against the block in requirements.txt)
+#   make test             (812 checks across the seven suites, all passing)
+#
+# torchaudio 2.8.0 comes in matched to torch 2.8.0. pyannote emits a
+# deprecation warning about torchaudio.list_audio_backends on import; it is
+# upstream's, harmless, and removed in torchaudio 2.9.
+#
+# Only the direct dependency is pinned, for the reason given in
+# requirements.txt: the transitive closure differs by interpreter and platform,
+# and pinning it from one machine ships a file that cannot install on another.
+#
+# MODEL WEIGHTS ARE NOT INSTALLED BY PIP. pyannote's pipelines are gated on
+# Hugging Face, which needs a one-time manual step pip cannot do for you:
+#
+#   1. Log in to huggingface.co and accept the user conditions on each of
+#        pyannote/speaker-diarization-3.1
+#        pyannote/segmentation-3.0
+#        pyannote/wespeaker-voxceleb-resnet34-LM   (if it prompts)
+#      Gating is tied to the ACCOUNT, not the token. Miss one and the load
+#      fails with the same unhelpful 401/403 as a bad token.
+#   2. Create a token. Read-only is enough; no write, no inference scope.
+#      A fine-grained token additionally needs "Read access to contents of all
+#      public gated repos you can access" ticked, or the download 401s even
+#      though the account accepted the terms.
+#   3. .venv/bin/hf auth login   (stores the token under ~/.cache/huggingface)
+#      Prefer this over exporting HF_TOKEN, which does not survive a new shell.
+#      NOTE: the command is `hf`, not `huggingface-cli`. huggingface_hub
+#      renamed the entry point, and every pyannote README still says
+#      `huggingface-cli login`, which is not installed here and fails with
+#      "command not found".
+#
+# TWO INTEGRATION BREAKAGES, both hit on a clean install of this pin:
+#
+#   huggingface_hub must stay BELOW 1.0 — hence the pin here. pyannote 3.4.0
+#   passes use_auth_token= to hf_hub_download (core/pipeline.py:90). hub 1.x
+#   dropped the compatibility shim in utils/_validators.py that translated it
+#   to token=, so the load dies with "unexpected keyword argument". 0.36.2
+#   still has the shim. Installing this file downgrades hub 1.8.0 -> 0.36.2,
+#   which is the ONLY change it makes to the pre-existing environment; both
+#   Whisper backends were re-verified after it (mlx-whisper's sole hub call is
+#   snapshot_download(repo_id=...), unchanged across 0.x and 1.x, and
+#   openai-whisper never imports the hub).
+#
+#   torch >=2.6 refuses the checkpoints by default. weights_only flipped to
+#   True and pyannote's checkpoints carry four non-tensor globals. Allowlist
+#   exactly these before calling from_pretrained — do NOT set
+#   weights_only=False, which permits arbitrary code execution from a
+#   downloaded file:
+#
+#     import torch, pyannote.audio.core.task as T
+#     torch.serialization.add_safe_globals([
+#         torch.torch_version.TorchVersion,
+#         T.Specifications, T.Problem, T.Resolution])
+#
+# COST, measured on this recording (150 min, Apple M4, Metal backend): 12.8
+# minutes wall clock, peak RSS ~0.8 GB. Embeddings are 93% of that (11m57s);
+# segmentation is 36s and everything else is under a second. See
+# spec/speaker-attribution.md SPEAKER-14 ... SPEAKER-18 for the accuracy this
+# bought and the two caveats on reading it.
+
+huggingface_hub<1.0,>=0.36
+pyannote.audio==3.4.0

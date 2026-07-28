@@ -59,10 +59,15 @@ OUTPUT ?= $(if $(STEM),$(STEM),$(shell t=$(call sq,$(TRANSCRIPT)); \
 # Extra flags: make ARGS="--model large-v3 --backend openai"
 # These REPLACE the defaults rather than adding to them (?=), so anything you
 # still want has to be repeated.
-# -c 1 keeps every decode down to about a minute, which is what stops Whisper
-# looping. transcribe passes it on to its own repair pass; `fix` sets the same
-# thing explicitly so a standalone repair slices its windows identically.
-ARGS     ?= --model large-v2 -c 1 -l en
+# -c 5 was measured against -c 1, 2, 3 and 10 on this recording; chunk length
+# has no effect on how often Whisper loops (spec CHUNK-7 … CHUNK-10), so the
+# minute-long chunks this used to pass were paying for something they did not
+# buy. 5 is a little faster, cuts on silence more often, and keeps a 2x margin
+# under the ten minutes where conditioning really does take over.
+#
+# FIX_ARGS stays at -c 1: a repair window is already about a minute, so -c 1
+# means "do not sub-chunk it" rather than "keep the decode short".
+ARGS     ?= --model large-v2 -c 5 -l en
 FIX_ARGS ?= --model large-v2 -c 1 -l en
 
 CLAUDE ?= claude
@@ -72,8 +77,9 @@ CLAUDE ?= claude
 # recipe for why that is not a stylistic preference.
 PROMPT         ?= analyze.md
 SUMMARY_PROMPT ?= summarize.md
+NAMING_PROMPT  ?= naming.md
 
-.PHONY: help all transcribe check fix analyze readable test setup clean distclean
+.PHONY: help all pipeline transcribe check fix analyze readable diarize speakers names test setup clean distclean
 
 # A bare `make` used to mean `all: transcribe`, which on a fresh clone spent
 # several minutes and several hundred megabytes on setup before announcing that
@@ -89,7 +95,13 @@ help:
 	'  make fix        INPUT=local/audio.m4a   re-decode the defective stretches only' \
 	'  make analyze    INPUT=local/audio.m4a   hand the transcript to Claude for the judgement calls' \
 	'  make readable   INPUT=local/audio.m4a   the document a person reads: summary + transcript' \
-	'  make test                               run the four test suites, decoding stubbed' \
+	'  make diarize    INPUT=local/audio.m4a   who was speaking — optional extra install, see' \
+	'                                          requirements-diarize.txt. Writes a sidecar.' \
+	'  make speakers   INPUT=local/audio.m4a   assign that sidecar onto the transcript' \
+	'  make names      INPUT=local/audio.m4a   put names to clusters where the transcript' \
+	'                                          says one — best-effort, most stay anonymous' \
+	'  make pipeline   INPUT=local/audio.m4a   every step above, in order, no stopping' \
+	'  make test                               run the seven test suites, decoding stubbed' \
 	'  make setup                              build the venv and install the models' \
 	'  make clean      INPUT=local/audio.m4a   delete this recording'"'"'s outputs, nothing else' \
 	'  make distclean  CONFIRM=1               delete the venv and EVERY transcript in output/' \
@@ -108,12 +120,51 @@ help:
 	'  NO_REPAIR=1 transcribe stops after the raw transcription' \
 	'  PRINT=1     analyze runs one-shot and prints its findings instead of opening a session' \
 	'  NO_SUMMARY=1 readable assembles the transcript only — no Claude, no cost' \
+	'  SPEAKERS=1   readable labels who is speaking (needs make diarize first)' \
+	'  NAMES=1      readable also names them (needs make names first; implies SPEAKERS)' \
+	'  NO_DIARIZE=1 pipeline skips speakers and names entirely' \
+	'  DIARIZE_ARGS flags for diarize.py run   (e.g. --max-speakers 25)' \
+	'  SPEAKERS_ARGS flags for diarize.py apply (e.g. --contested-ratio 0.5)' \
+	'  GLOSSARY    proper spellings for names the decoder mishears. Defaults to the' \
+	'              first of OUTPUT.glossary.txt, glossary.txt, local/glossary.txt' \
+	'              that exists; GLOSSARY= disables it. See glossary.py.' \
 	'  CONFIRM=1   required by distclean, which is otherwise unrecoverable' \
 	'' \
 	'ARGS and FIX_ARGS replace rather than append: `make fix FIX_ARGS="--strict"`' \
-	'drops the -c 1 -l en that keeps each decode short. Pass them again.'
+	'drops the model, chunk size and language they set. Pass them again.'
 
 all: transcribe
+
+# Everything, in order, for a recording that needs no judgement calls.
+#
+# The whole pipeline as one chain, so the steps and their order are written
+# down in one place. It is NOT the best way to process a real recording:
+# `make check` sits between transcription and the deliverable because gap
+# triage needs a person to read the numbers, and running straight past it
+# means shipping a transcript nobody looked at. The `/transcribe` skill drives
+# these targets one at a time and stops where a decision is owed. Reach for
+# this when the recording is already known to be clean.
+#
+#   make pipeline INPUT=local/audio.m4a               hours; every step
+#   make pipeline INPUT=local/audio.m4a NO_DIARIZE=1  skip speakers and names
+pipeline: $(STAMP)
+	$(need_input)
+	@printf '\n=== 1/5  transcribe, with the automatic repair pass ===\n'
+	@$(MAKE) --no-print-directory transcribe INPUT=$(call sq,$(INPUT))
+	@printf '\n=== 2/5  what is left (read this) ===\n'
+	@$(MAKE) --no-print-directory check INPUT=$(call sq,$(INPUT)) || true
+ifndef NO_DIARIZE
+	@printf '\n=== 3/5  who was speaking ===\n'
+	@$(MAKE) --no-print-directory diarize INPUT=$(call sq,$(INPUT))
+	@printf '\n=== 4/5  names, where the transcript states one ===\n'
+	@$(MAKE) --no-print-directory names INPUT=$(call sq,$(INPUT))
+	@printf '\n=== 5/5  the deliverable ===\n'
+	@$(MAKE) --no-print-directory readable INPUT=$(call sq,$(INPUT)) NAMES=1
+else
+	@printf '\n=== 3/3  the deliverable (speakers skipped) ===\n'
+	@$(MAKE) --no-print-directory readable INPUT=$(call sq,$(INPUT))
+endif
+	@printf '\nDone: %s\n' $(call sq,$(OUTPUT).readable.md)
 
 # A path is only allowed to look like a path. Quoting alone would be enough for
 # the recipes below, but local/ is a folder things get dropped into, and a file
@@ -227,23 +278,79 @@ analyze: $(STAMP)
 # without rebuilding the document — and so a bad summary is obvious rather than
 # buried in the middle of a 23,000-word file.
 #
+# SPEAKERS=1 marks the transcript up from the diarization sidecar, if one has
+# been built. It is opt-in rather than automatic because the sidecar is an
+# optional install away and a missing one should not fail the deliverable.
+#
 #   make readable                    summarise, then assemble
 #   make readable NO_SUMMARY=1       transcript only, no Claude, no cost
+#   make readable SPEAKERS=1         label who is speaking (needs make diarize)
 #   make readable SUMMARY_PROMPT=<f> ask for a different summary
+#
+# NAMES=1 implies SPEAKERS=1 — a name is put to a cluster, so there has to be
+# one. Asking for names without speakers is a slip, not a configuration.
+# Defined once because the summary pass and the assembly pass must be given the
+# same labels: the whole point of the pipe above is that they agree.
+SPEAKER_FLAGS = \
+	$(if $(or $(SPEAKERS),$(NAMES)),--speakers $(call sq,$(OUTPUT).speakers.json),) \
+	$(if $(NAMES),--names $(call sq,$(OUTPUT).names.json),)
+
+# Proper spellings for names the decoder cannot know (see glossary.py). Applied
+# to the rendered document only; the transcript files keep what Whisper wrote.
+#
+# Opt-in by existing: a glossary is hand-written, so having one *is* the
+# request to use it, and there is no second switch to forget. GLOSSARY=<file>
+# names one explicitly, GLOSSARY= turns it off for a run.
+GLOSSARY ?= $(firstword $(wildcard $(OUTPUT).glossary.txt glossary.txt local/glossary.txt))
+GLOSSARY_FLAGS = $(if $(GLOSSARY),--glossary $(call sq,$(GLOSSARY)),)
+
 readable: $(STAMP)
 	$(need_transcript)
 	$(need_output)
+# Checked before the summary rather than after it. The summary is the only step
+# here that costs money, and a missing sidecar used to be discovered *after*
+# paying for one — the run failed having spent everything it was going to spend.
+ifdef SPEAKERS
+	@test -f $(call sq,$(OUTPUT).speakers.json) || { \
+		echo "Error: SPEAKERS=1 but no diarization sidecar at:"; \
+		printf '  %s\n' $(call sq,$(OUTPUT).speakers.json); \
+		printf 'Run the diarization pass first:  make diarize INPUT=%s\n' \
+			$(call sq,$(INPUT)); exit 1; }
+endif
+ifdef NAMES
+	@test -f $(call sq,$(OUTPUT).speakers.json) || { \
+		echo "Error: NAMES=1 implies SPEAKERS=1, but there is no sidecar at:"; \
+		printf '  %s\n' $(call sq,$(OUTPUT).speakers.json); \
+		printf 'Run the diarization pass first:  make diarize INPUT=%s\n' \
+			$(call sq,$(INPUT)); exit 1; }
+	@test -f $(call sq,$(OUTPUT).names.json) || { \
+		echo "Error: NAMES=1 but no names sidecar at:"; \
+		printf '  %s\n' $(call sq,$(OUTPUT).names.json); \
+		printf 'Put names to the clusters first:  make names INPUT=%s\n' \
+			$(call sq,$(INPUT)); exit 1; }
+endif
 ifndef NO_SUMMARY
 	@test -f $(call sq,$(SUMMARY_PROMPT)) || { echo "Error: no prompt at:"; \
 		printf '  %s\n' $(call sq,$(SUMMARY_PROMPT)); exit 1; }
 	@command -v $(CLAUDE) >/dev/null || { echo "Error: '$(CLAUDE)' not on PATH — see https://claude.com/claude-code"; exit 1; }
 	@printf 'Summarising %s with $(CLAUDE) …\n' $(call sq,$(TRANSCRIPT))
+# The summary is written from `readable.py --transcript-only`, not from the raw
+# transcript, so Claude reads exactly the document the reader will. Piping the
+# bare .timestamped.txt in meant it was summarising an unlabelled transcript
+# while the document below carried speakers and names: it correctly announced
+# "this transcript is not diarized" directly above a diarized transcript, and
+# it cited segment timestamps, only 20% of which matched a paragraph anchor in
+# the finished document — so four out of five of the summary's own
+# cross-references pointed at a heading that was not there.
+#
 # Written beside the summary and moved into place only once it is non-empty.
 # Redirecting straight onto the summary truncates it before Claude has said
 # anything, so an error, a timeout or a ^C destroyed the previous good summary —
 # the one file here that costs money and can be worth hand-editing.
-	@$(CLAUDE) -p "$$(cat $(call sq,$(SUMMARY_PROMPT)))" \
-		< $(call sq,$(TRANSCRIPT)) > $(call sq,$(OUTPUT).summary.md.tmp)
+	@$(PYTHON) readable.py $(call sq,$(TRANSCRIPT)) --transcript-only \
+		$(SPEAKER_FLAGS) $(GLOSSARY_FLAGS) \
+		| $(CLAUDE) -p "$$(cat $(call sq,$(SUMMARY_PROMPT)))" \
+		> $(call sq,$(OUTPUT).summary.md.tmp)
 	@test -s $(call sq,$(OUTPUT).summary.md.tmp) || { \
 		rm -f $(call sq,$(OUTPUT).summary.md.tmp); \
 		printf 'Error: the summary came back empty — %s is unchanged\n' \
@@ -253,13 +360,73 @@ ifndef NO_SUMMARY
 endif
 	$(PYTHON) readable.py $(call sq,$(TRANSCRIPT)) \
 		--output $(call sq,$(OUTPUT).readable.md) \
+		$(SPEAKER_FLAGS) $(GLOSSARY_FLAGS) \
 		$(if $(NO_SUMMARY),,--summary $(call sq,$(OUTPUT).summary.md))
+
+# Who was speaking. Optional, and kept apart from everything above: it needs
+# an install setup.sh does not do (see requirements-diarize.txt) and it writes
+# a sidecar rather than touching the transcript, so nothing else depends on it.
+#
+#   make diarize                     the expensive pass, once per recording
+#   make diarize DRY=1               say what it would do, decode nothing
+#   make diarize DIARIZE_ARGS=...    e.g. --max-speakers 25
+#   make speakers                    assign the sidecar onto the transcript
+diarize: $(STAMP)
+	$(need_input)
+	$(need_output)
+	$(PYTHON) diarize.py run $(call sq,$(INPUT)) \
+		--output $(call sq,$(OUTPUT).speakers.json) \
+		$(if $(DRY),--dry-run,) $(DIARIZE_ARGS)
+
+speakers: $(STAMP)
+	$(need_transcript)
+	$(need_output)
+	@test -f $(call sq,$(OUTPUT).speakers.json) || { \
+		printf 'Error: no speaker sidecar at:\n  %s\n' \
+			$(call sq,$(OUTPUT).speakers.json); \
+		printf 'Run the diarization pass first:  make diarize INPUT=%s\n' \
+			$(call sq,$(INPUT)); exit 1; }
+	$(PYTHON) diarize.py apply $(call sq,$(TRANSCRIPT)) \
+		--speakers $(call sq,$(OUTPUT).speakers.json) \
+		--output $(call sq,$(OUTPUT).speakers.md) $(SPEAKERS_ARGS)
+
+# Names, where the transcript states one. Best-effort by construction: most
+# clusters stay anonymous and that is the expected result, not a failure.
+# Two steps for the same reason `readable` has two — gathering is free and
+# mechanical, deciding is neither, and the decision is worth re-reading.
+#
+#   make names                       gather, ask Claude, validate, write
+#   make names NAMES_ARGS=...        flags for names.py gather
+names: $(STAMP)
+	$(need_transcript)
+	$(need_output)
+	@test -f $(call sq,$(OUTPUT).speakers.json) || { \
+		printf 'Error: no speaker sidecar at:\n  %s\n' \
+			$(call sq,$(OUTPUT).speakers.json); \
+		printf 'Names are put to clusters, so diarize first:  make diarize INPUT=%s\n' \
+			$(call sq,$(INPUT)); exit 1; }
+	@test -f $(call sq,$(NAMING_PROMPT)) || { echo "Error: no prompt at:"; \
+		printf '  %s\n' $(call sq,$(NAMING_PROMPT)); exit 1; }
+	@command -v $(CLAUDE) >/dev/null || { echo "Error: '$(CLAUDE)' not on PATH — see https://claude.com/claude-code"; exit 1; }
+	$(PYTHON) names.py gather $(call sq,$(TRANSCRIPT)) \
+		--output $(call sq,$(OUTPUT).names-candidates.json) $(NAMES_ARGS)
+	@printf 'Resolving names with $(CLAUDE) …\n'
+# Claude's answer goes through `names.py ingest`, which refuses anything that
+# is not JSON, names a cluster the recording does not have, or carries a name
+# with no evidence behind it. The sidecar is only written once it passes.
+	@$(CLAUDE) -p "$$(cat $(call sq,$(NAMING_PROMPT)))" \
+		< $(call sq,$(OUTPUT).names-candidates.json) \
+		| $(PYTHON) names.py ingest $(call sq,$(TRANSCRIPT)) - \
+			--output $(call sq,$(OUTPUT).names.json)
 
 test: $(STAMP)
 	$(PYTHON) test_transcribe.py
 	$(PYTHON) test_repair.py
 	$(PYTHON) test_readable.py
 	$(PYTHON) test_prompt.py
+	$(PYTHON) test_diarize.py
+	$(PYTHON) test_names.py
+	$(PYTHON) test_glossary.py
 
 # setup.sh owns every install step; the Makefile only decides when to call it.
 $(STAMP): setup.sh

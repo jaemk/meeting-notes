@@ -1,11 +1,49 @@
 # Working in this repo
 
-Whisper transcription with an automatic diagnose → repair → verify cycle.
+## What this project is
+
+It turns a recording of a meeting into a document someone can act on: an
+executive summary with owners and follow-ups, over a timestamped transcript
+marked with who was speaking. Point it at an audio file, wait, and read
+`output/<name>.readable.md`.
+
+It exists because the obvious version does not work. Whisper on a two-hour
+recording conditions on its own output and gets stuck repeating itself, drops
+speech it cannot hear, and invents endings for chunks whose audio has run out.
+So the pipeline is built around finding and repairing its own defects rather
+than trusting the first pass, and around **declining to guess** — an unnamed
+speaker, a reported gap and a flagged inconsistency are all correct outputs
+here, and each of them is a place where a plausible fabrication would be worse
+than an admission.
+
+Nothing about it is specific to one meeting or one group. It expects a single
+audio file of people talking; everything else — who they are, what they call
+their places — is either derived or supplied by the person running it.
+
+## How it is used
+
+`README.md` is the user guide: dependencies, setup, every command, what a run
+costs. Read that first if you have not run this before.
+
+Day to day it is driven by the **`/transcribe` skill**
+(`.claude/skills/transcribe/SKILL.md`), which walks the steps in order and
+stops at the two places a person has to look — gap triage and the summary.
+The skill is the running order; this file is the reasoning behind its
+defaults, and what has already been tried and did not work. Read
+`analyze.md` before reviewing a transcript output.
+
+The whole thing is `make` targets, so it works fine without an agent:
+`make help` lists them. `make pipeline` runs everything end to end for a
+recording already known to be clean.
+
+## The shape of the code
+
 `transcribe.py` chunks and merges; `repair.py` finds defects and fixes them;
-`analyze.md` is the prompt `make analyze` hands to Claude for the judgement
-calls the rules can't make. Read `analyze.md` before reviewing a transcript —
-this file is about working on the code and running the process, that one is
-about reading the output.
+`diarize.py` separates voices; `names.py` puts names to them where the
+transcript states one; `glossary.py` corrects proper nouns the decoder cannot
+know; `readable.py` assembles the deliverable. `analyze.md`, `summarize.md`
+and `naming.md` are the prompts handed to Claude for the judgement calls the
+rules can't make.
 
 ## Hard constraints
 
@@ -16,8 +54,18 @@ about reading the output.
 - **Always `.venv/bin/python`**, never the system interpreter.
 - **`local/` and `output/` are gitignored and must stay that way.** They hold
   real recordings and real transcripts of private meetings. Nothing from either
-  goes in a commit, a test fixture, or a code comment. Fixtures are synthetic
-  and built by `testlib.py`.
+  goes in a commit, a test fixture, a spec, or a code comment — including a
+  name, a place or a quote. Fixtures are synthetic and built by `testlib.py`,
+  and every example name in a committed file is invented.
+  `.gitignore` also matches by what a file *is* — audio and video extensions,
+  transcript and deliverable suffixes, the four sidecars, and all three
+  glossary lookup paths — because the directory rules alone do not cover a
+  file written elsewhere by `--output` or dropped in by hand. **Add the
+  pattern when you add a stage that writes something new.**
+  The trap to know about: a *paraphrase* of a real line still leaks it.
+  `summarize.md` carried "my good buddy X will take over" as an example of
+  inferring a speaker from context — the name was blanked, but the sentence
+  was lifted from a real meeting. Invent the example instead.
 - Decodes cost minutes. Say what you're about to run and roughly what it costs
   before running it, and prefer `--dry-run` first.
 
@@ -140,6 +188,33 @@ on a boosted file reports everything as speech.
   minutes, and it re-rolls every part of the file that is currently fine.
 - **`--include-gaps` as a default.** It roughly triples the decode and is the
   one option that can make a transcript worse.
+- **Shortening `-c` to suppress loops.** Measured across `-c 1`, `2`, `3`, `5`
+  and `10` on the worst 30 minutes in the recording: loops came back 4, 8, 5, 3
+  and 3, with no trend. Loops start a mean 46% of the way into their chunk and
+  cluster by position in the *recording*, not the chunk — they are a decoder
+  failure on hard audio, and a shorter chunk cannot reach them. `make` used to
+  pass `-c 1` for this reason and it bought nothing. `spec/chunked-transcription.md`,
+  CHUNK-7 … CHUNK-12.
+- **Marking speaker changes from audio level and pitch.** Measured on a
+  150-minute recording and it does not work: one voice is stable to ±12 Hz but
+  eight of nine speakers collide within that, level tracks where someone stood
+  rather than who they are, and both features average the two voices together
+  at the hand-off itself. A threshold set at the median real boundary yields
+  roughly fifteen false turn marks per real one. See `spec/speaker-attribution.md`,
+  SPEAKER-5 … SPEAKER-12. Real diarization is the answer, and is affordable
+  here — SPEAKER-13 … SPEAKER-15.
+- **Capping `--max-speakers` to trim the cluster count.** The 39 clusters on
+  this recording are two different things at once: ten are real residents who
+  spoke once, and three are smears of sub-second backchannel with no core
+  anywhere in the file. Capping merges the *nearest* clusters, which takes the
+  real people and leaves the smears, because a smear is near everything.
+  SPEAKER-29 … SPEAKER-31. Leave the count unconstrained and exclude the
+  smears downstream, where they can be identified by shape.
+- **Naming clusters from who speaks next.** "<Name>, do you have any comments?"
+  followed by a new voice looks like a name for that voice, and mechanically it
+  names 2 of 39 clusters with one of the two probably wrong. Onset is the
+  unreliable half of diarization (SPEAKER-17) and "who speaks next" is a
+  question about onsets. `spec/speaker-naming.md`, NAME-5.
 
 ## Signals that a decode came back worse
 
@@ -171,6 +246,61 @@ on a boosted file reports everything as speech.
    purpose: the summary is the only part that costs anything and the only part
    that can be wrong in a way the transcript is not, so it lands as its own
    file first.
+8. Optionally, who was speaking: `make diarize INPUT=local/NAME.m4a` once per
+   recording (~13 min, needs the optional install — `requirements-diarize.txt`),
+   then `make readable INPUT=... SPEAKERS=1` to label the deliverable. Labels
+   are cluster numbers, never names. `make speakers` renders the same
+   attribution as a standalone document, which is the cheap way to try a
+   different `--contested-ratio` without re-running the summary.
+
+## Proper nouns the decoder cannot know
+
+Whisper spells unfamiliar names phonetically and does it *consistently*, which
+is what makes it dangerous — the same wrong spelling on every page reads as
+authoritative. Nothing here can detect it: the repair loop finds loops,
+rewinds and gaps, and a misspelled name is none of those. A glossary is the
+only fix, and it is a person writing the spelling down once.
+
+    # local/glossary.txt
+    Wren Ashby: Ren Ashbee, Wren Ashbee
+    Thornbury Cove: Thornberry Cove, Thorn Bury Cove
+
+Left of the colon is the wanted spelling, right of it what the transcript
+actually says. `make readable` picks it up automatically — having a glossary
+*is* the request to use it — and `GLOSSARY=` turns it off for a run. Check one
+before trusting it:
+
+    .venv/bin/python glossary.py local/glossary.txt --against output/NAME.repaired.timestamped.txt
+
+That prints what it would correct **and which entries never matched**, which is
+the half that finds typos: an entry that never fires and an entry spelled
+wrong look identical otherwise. Expect to discover variants iteratively — the
+first pass here found six spellings of one name, and four more surfaced only
+after applying it and reading what the summary still flagged.
+
+Two rules, both in `spec/spelling-glossary.md`:
+
+- **A glossary lives in `local/` and never in the repo.** It is nothing but
+  proper nouns from private meetings, so the same rule that covers a
+  transcript covers it.
+- **It never edits the transcript.** Corrections apply when a document is
+  rendered; `.timestamped.txt`, `.srt` and `.txt` keep what the decoder wrote,
+  because they are the audit trail back to the audio. The document says a
+  glossary was applied and names what changed, so the difference between the
+  two is explained rather than mysterious.
+
+`--contested-ratio` defaults to 0.7, chosen by reading the segments each value
+disagrees about rather than by argument (SPEAKER-26), and re-derived once more
+after contested segments began naming both voices (SPEAKER-39). **Don't sweep
+it again.** Every band from 0.3 to 0.9 scores 33–49% suspect with no trend:
+cluster onset is a median 6.5 s from the truth while a segment runs about 2 s,
+so overlap at a segment edge cannot tell a real hand-off from a misplaced
+boundary, and no threshold over that overlap can either (SPEAKER-40). The
+lever that would actually help is excluding smear clusters from a mix, and
+that is blocked on not having a smear test that survives contact with the data
+(SPEAKER-42). **When a second meeting gets recorded, that is the thing to
+do** — `spec/smear-cluster-identification.md` has the protocol, and the point
+of waiting is that a threshold fitted to one file cannot be validated on it.
 
 When summarising, the transcript's own self-corrections matter. A figure stated
 once and then revised a minute later ("actually it's…") is common in a meeting;
@@ -201,10 +331,14 @@ by measurement — these are a few lines each against `T.load_timestamped`:
 
 ## Tests
 
-    make test        # test_transcribe.py + test_repair.py + test_readable.py
-                      # + test_prompt.py, decoding stubbed
+    make test        # 812 checks, decoding stubbed, no model or network:
+                     #   test_transcribe.py  test_repair.py   test_readable.py
+                     #   test_prompt.py      test_diarize.py  test_names.py
+                     #   test_glossary.py
+                     # The speaker suites do not need the optional
+                     # diarization install either — they stub it.
 
-All four suites use `testlib.py`'s `Checks` harness: `check("prose describing
+All seven suites use `testlib.py`'s `Checks` harness: `check("prose describing
 the property", condition, detail_on_failure)` grouped by `check.section(...)`.
 Check names read as sentences about behaviour, not as function names. Every
 number asserted is a property of the fixture generator, so a fresh clone runs

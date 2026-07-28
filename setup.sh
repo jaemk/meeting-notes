@@ -164,6 +164,12 @@ hundred MB for a small model, a couple of GB for large — so the first run
 pauses after "Split into N chunks" while the download runs. It is cached
 afterwards.
 
+Speaker diarization is NOT installed — it is optional and costs 1-2 GB. The
+transcription pipeline does not need it. To add it later, see the header of
+requirements-diarize.txt, which also covers the Hugging Face steps pip cannot
+do for you:
+  .venv/bin/pip install -r requirements-diarize.txt
+
 Usage:
   make transcribe INPUT=local/audio.m4a  transcribe, then auto-repair defects
   make check INPUT=local/audio.m4a       what is left in the transcript

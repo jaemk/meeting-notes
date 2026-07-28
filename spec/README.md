@@ -25,7 +25,10 @@ can be built). Keep each row's status current with `spec.py set`.
 | Run cost and durability | done | [run-cost-and-durability.md](run-cost-and-durability.md) |
 | Command-line surface | pending | [command-line-surface.md](command-line-surface.md) |
 | Splice boundary de-duplication | pending | [splice-boundary-de-duplication.md](splice-boundary-de-duplication.md) |
-| Speaker attribution | research | [speaker-attribution.md](speaker-attribution.md) |
+| Speaker attribution | done | [speaker-attribution.md](speaker-attribution.md) |
+| Speaker naming | done | [speaker-naming.md](speaker-naming.md) |
+| Spelling glossary | done | [spelling-glossary.md](spelling-glossary.md) |
+| Smear cluster identification | research | [smear-cluster-identification.md](smear-cluster-identification.md) |
 
 ## What `done` does and does not promise
 
@@ -46,6 +49,23 @@ shell, and nothing in the suite runs `make` or `setup.sh`:
 - `COST-1` … `COST-6` — statements about what a run costs and what an
   interruption loses. `COST-4` describes current behaviour that no test
   asserts.
+- `SPEAKER-19`'s `diarize.py run` half — loading pyannote and calling it.
+  `test_diarize.py` stubs the pipeline so the suite needs no model, no GPU and
+  no network, which means the assignment logic in `SPEAKER-21` … `SPEAKER-25`
+  is tested and the model call is not. `SPEAKER-5` … `SPEAKER-18` and
+  `SPEAKER-26` … `SPEAKER-31` are measured findings about one recording rather
+  than assertions about code, and no test re-derives them — `SPEAKER-26`'s
+  choice of 0.7 is asserted as the shipped default, but the reading that chose
+  it is not reproducible from the fixture.
+- `NAME-18`'s middle step — handing the candidates to Claude. `test_names.py`
+  covers the gathering and the validation on either side of it, and feeds
+  `ingest` answers by hand, so the two halves that can be wrong silently are
+  tested and the model call is not. `NAME-3` … `NAME-7` are measured findings
+  about one recording. `CHUNK-7` … `CHUNK-12` likewise: the chunk-length
+  experiment is recorded, not re-run, and `make test` decodes nothing.
+- `make pipeline` and `make names` as recipes, like every other `make` target
+  here. The `/transcribe` skill in `.claude/skills/` is documentation of the
+  running order and is verified by reading it.
 
 Treat those as documented intent that a change can break without turning the
 suite red. Reviewing them means reading the recipe.

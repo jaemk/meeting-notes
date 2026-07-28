@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python test_transcribe.py)",
+      "Bash(.venv/bin/python test_transcribe.py *)",
+      "Bash(.venv/bin/python test_repair.py)",
+      "Bash(.venv/bin/python test_repair.py *)",
+      "Bash(.venv/bin/python test_readable.py)",
+      "Bash(.venv/bin/python test_readable.py *)",
+      "Bash(make test)",
+      "Bash(.venv/bin/python transcribe.py --help)",
+      "Bash(.venv/bin/python repair.py --help)",
+      "Bash(.venv/bin/python readable.py --help)",
+      "Bash(ffprobe *)",
+      "Bash(.venv/bin/python test_prompt.py)",
+      "Bash(.venv/bin/python test_prompt.py *)",
+      "Bash(.venv/bin/python test_diarize.py)",
+      "Bash(.venv/bin/python test_diarize.py *)",
+      "Bash(.venv/bin/python test_names.py)",
+      "Bash(.venv/bin/python test_names.py *)",
+      "Bash(.venv/bin/python test_glossary.py)",
+      "Bash(.venv/bin/python test_glossary.py *)",
+      "Bash(.venv/bin/python glossary.py --help)",
+      "Bash(.venv/bin/python diarize.py --help)",
+      "Bash(.venv/bin/python names.py --help)",
+      "Bash(make help)",
+      "Bash(git check-ignore *)"
+    ]
+  }
+}

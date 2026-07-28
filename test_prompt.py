@@ -405,7 +405,8 @@ else:
     check.section("the suites the test target runs")
     t = expand("test")
     for suite in ["test_transcribe.py", "test_repair.py", "test_readable.py",
-                  "test_prompt.py"]:
+                  "test_prompt.py", "test_diarize.py", "test_names.py",
+                  "test_glossary.py"]:
         check(f"make test runs {suite}", suite in t, t)
 
 shutil.rmtree(TMP, ignore_errors=True)

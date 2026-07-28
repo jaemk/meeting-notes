@@ -1,5 +1,11 @@
 .venv/
 
+# Claude Code's per-machine settings. .claude/settings.json and
+# .claude/skills/ ARE committed — they are how the project describes itself to
+# an agent. This one is personal: it accumulates whatever permissions one
+# person happened to grant, with absolute paths from their machine in it.
+.claude/settings.local.json
+
 # Source audio lives here and is never committed.
 local/*
 !local/.gitkeep
@@ -18,3 +24,48 @@ output/*
 *.summary.md
 *.repaired.*
 *.bak
+
+# The speaker sidecars, which are the most directly identifying files the
+# pipeline produces. A names sidecar maps a real person to a voice; the
+# candidates file it is built from carries every name-like mention in the
+# meeting with the surrounding conversation quoted around it, which is a
+# larger disclosure than the transcript itself in a smaller file.
+# Both forms of each: the pipeline always writes <recording>.names.json, but
+# `*.names.json` does not match a file called plainly `names.json`, and a
+# hand-made or hand-renamed one is exactly the case defence in depth is for.
+names.json
+names-candidates.json
+speakers.json
+speakers.md
+*.names.json
+*.names-candidates.json
+*.speakers.json
+*.speakers.md
+
+# Spelling glossaries. Nothing in one but proper nouns from private meetings —
+# the names of the people and the places they talk about — so it is exactly
+# the content this file exists to keep out. All three of the lookup paths
+# glossary.py checks are covered, including the bare name at the repo root:
+# local/ is already ignored above, the other two are not.
+glossary.txt
+*.glossary.txt
+
+# Recordings, wherever they land. local/ is where they belong and is ignored
+# above, but an audio or video file anywhere in this tree is a room full of
+# people talking and is never a source file. Meetings get recorded to video
+# as often as to audio.
+*.m4a
+*.m4b
+*.mp3
+*.wav
+*.aac
+*.flac
+*.ogg
+*.opus
+*.wma
+*.aiff
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
