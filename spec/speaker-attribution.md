@@ -475,3 +475,25 @@ which is most of them. With `--speakers` and no sidecar it stops and says so
 rather than quietly producing an unlabelled document that looks like it
 worked. `diarize.py apply` stays, because tuning a threshold should not mean
 re-running the summary step.
+
+## Whether one pass covers a whole meeting
+
+## SPEAKER-44
+
+The pass is whole-file, and that is what makes it correct for a long Q&A or a
+town hall. `diarize.py run` hands the entire recording to the pipeline in a
+single call — nothing crops, windows or samples it — and pyannote clusters
+embeddings globally rather than incrementally, so a voice first heard an hour
+in is compared against every other voice in the meeting and gets its own
+cluster. On the 150-minute recording the latest cluster first appears at 73
+minutes and turns run to 149.7; on the 140-minute one, 58.9 against a 139.9
+end. There is no early-window bias to fix.
+
+This is recorded because the cost figure reads like a coverage figure. "About
+13 minutes for a 2½-hour meeting" is wall clock — roughly a tenth of the
+recording's length, 93% of it in the embedding stage, per SPEAKER-19 — and
+was misread as 13 minutes of audio. The README now says which it is. Anything
+that would genuinely restrict coverage — chunking the audio for memory, a
+`--from`/`--to` window, sampling to cut the embedding cost — breaks the
+global-clustering property above and would split one person across two
+clusters at every boundary. Do not add one without saying so here first.

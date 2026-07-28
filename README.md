@@ -231,9 +231,11 @@ Then:
     make diarize  INPUT=local/meeting.m4a     # once per recording
     make readable INPUT=local/meeting.m4a SPEAKERS=1
 
-Diarization takes roughly a tenth of the recording's length, so about 13
-minutes for a 2½-hour meeting. It only needs to run once. `make speakers`
-re-renders the result on its own, which is quick.
+It reads the whole recording — a voice that first speaks an hour in gets its
+own cluster, which is what a long Q&A or a town hall needs. The cost is compute
+time, not coverage: roughly a tenth of the recording's length, so a 2½-hour
+meeting takes about 13 minutes to diarize. It only needs to run once. `make
+speakers` re-renders the result on its own, which is quick.
 
 Speakers come out as numbers, not names. A recording will typically produce
 more clusters than there were people, because someone who says one word gets
