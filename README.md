@@ -78,8 +78,13 @@ duration, find silences to split at, and extract audio for each chunk.
 transcribe, not during setup: roughly 0.5 GB for `small`, 1.5 GB for `medium`,
 3 GB for the `large` models.
 
-**The `claude` CLI**, if you want the summary. It's used by `make readable`,
-`make names` and `make analyze`. Everything else works without it.
+**[Claude Code](https://claude.com/claude-code).** This is how the project is
+meant to be driven: it ships a `/transcribe` skill that runs the whole pipeline
+and stops where you need to make a decision. It's also what writes the summary
+and matches names to voices.
+
+You can run everything as `make` targets instead, and the transcription itself
+never needs it. See [Running it without Claude Code](#running-it-without-claude-code).
 
 A machine with Apple Silicon will be substantially faster; see
 [How long it takes](#how-long-it-takes).
@@ -102,8 +107,44 @@ used instead. You don't need to choose; the default picks whichever will run.
 
 ## Running it
 
-Put the recording in `local/`, then work through the steps. Only the first one
-takes real time.
+Put the recording in `local/`, open Claude Code in the project directory, and
+run the skill:
+
+    cp ~/somewhere/meeting.m4a local/
+    claude
+
+    > /transcribe local/meeting.m4a
+
+That's the whole thing. The skill works through transcription, checks the
+result, repairs what's worth repairing, identifies speakers, matches names, and
+writes the document. It tells you what each step will cost before starting it.
+
+Speaker labels need an optional install ([Who was speaking](#who-was-speaking)).
+If you haven't done it, the skill says so and carries on without them rather
+than stopping.
+
+It deliberately stops twice and waits for you:
+
+- **After the check**, to decide which of the remaining problems are worth
+  re-transcribing. Some are recoverable and some aren't, and the difference is
+  a judgement about the audio rather than something the tools can settle.
+- **At the summary**, because it's the one part that can be confidently wrong
+  in a way the transcript isn't. It's worth reading before you send it on.
+
+If you'd rather it didn't stop, ask it to run the whole pipeline without
+pausing. That's the right choice only when you already know the recording is
+clean.
+
+You can also just ask for what you want in your own words — "transcribe
+local/meeting.m4a and tell me what's still missing" gets you the same steps.
+
+## Running it without Claude Code
+
+Everything is a `make` target underneath, so the pipeline runs on its own. You
+lose the summary, the name matching and `make analyze`, all of which call
+Claude; the transcription and repair are unaffected.
+
+Work through the steps below. Only the first takes real time.
 
 ### 1. Transcribe
 
@@ -384,8 +425,11 @@ ffmpeg-generated audio file for the gap classifier.
   behaviour.
 - **`CLAUDE.md`** — orientation for Claude Code or another agent working in the
   repo: the constraints, the layout, and which spec covers what.
-- **`.claude/skills/transcribe/`** — the running order as a skill, for driving
-  the pipeline through an agent. The `make` targets do the same thing.
+- **`.claude/skills/transcribe/`** — the `/transcribe` skill, which is the
+  intended way to run this. It's checked into the repo, so it's available as
+  soon as you clone and open Claude Code here. Worth reading even if you drive
+  the `make` targets by hand: it's the running order, with the reason for each
+  step and the two places it stops.
 - **`analyze.md`, `summarize.md`, `naming.md`** — the prompts used for the
   three steps that ask Claude for a judgement.
 
