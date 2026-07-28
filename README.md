@@ -388,3 +388,12 @@ ffmpeg-generated audio file for the gap classifier.
   the pipeline through an agent. The `make` targets do the same thing.
 - **`analyze.md`, `summarize.md`, `naming.md`** — the prompts used for the
   three steps that ask Claude for a judgement.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+That covers this project's own code. The models it downloads at runtime have
+their own terms, which are not affected by it: Whisper is MIT, and pyannote's
+diarization models are MIT but gated behind user conditions you accept on your
+own Hugging Face account.
