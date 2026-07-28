@@ -86,3 +86,19 @@ A decode that comes back with nothing leaves the original text in place. Empty
 is not a repair: splicing it removes real segments and puts nothing where they
 were, turning a window Whisper merely mishandled into a hole. It is reported
 as a failed window and the transcript is left as it was.
+
+## REPAIR-15
+
+**Unpunctuated, lowercase output is a signal, not a style.** It means the text
+came from one of `REPAIR-8`'s retry or fallback attempts rather than a clean
+first decode, and it is reliably worse than what it replaced. A window that
+comes back in that shape should be reverted rather than kept.
+
+## REPAIR-16
+
+**Word count is not a quality measure, in either direction.** A window that
+comes back with more words may have gained duplications and invented filler; a
+window that drops from 163 words to 35 may be a loop correctly replaced by the
+one sentence that was really said, or may be real speech destroyed. Nothing in
+the counts distinguishes these. Only reading the text does, which is why the
+repair summary reports what changed rather than asserting that it improved.

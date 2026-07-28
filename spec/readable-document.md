@@ -52,3 +52,30 @@ An empty summary file is an error, not an empty section.
 Paragraph breaks are not speaker changes. Whisper does not diarize, so a pause
 is the closest available approximation of a turn boundary; it lands on one
 often and never reliably. See `speaker-attribution.md`.
+
+## DOC-10
+
+**The summariser is fed the rendered document, not the raw transcript.** `make
+readable` pipes `readable.py --transcript-only` — carrying the same paragraphs,
+the same speaker labels (`SPEAKER-21` …) and the same glossary corrections
+(`GLOSS-6`) — into Claude. `transcript_lines` is shared by both outputs so the
+two cannot drift.
+
+Piping the raw `.timestamped.txt` instead is a defect with two visible
+symptoms, and it shipped that way: the summary described an unlabelled
+transcript while the document below it carried speakers and names, and it cited
+*segment* timestamps rather than paragraph headings, so only 20% of its own
+cross-references landed on a heading that existed.
+
+This is why the glossary and naming steps run before the summary rather than
+after it. A correction applied only to the document leaves the summary spelling
+the name the old way.
+
+## DOC-11
+
+Every `[H:MM:SS]` the summary cites must be a paragraph heading present in the
+assembled document. The summariser is instructed to copy them verbatim rather
+than round or infer them, because a timestamp is a navigation aid and one that
+resolves to nothing is worse than none. Nothing enforces this at render time;
+it is checked by comparing the two files (`VERIFY-2`'s principle applied to the
+summary).

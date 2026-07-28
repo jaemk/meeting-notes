@@ -29,6 +29,7 @@ can be built). Keep each row's status current with `spec.py set`.
 | Speaker naming | done | [speaker-naming.md](speaker-naming.md) |
 | Spelling glossary | done | [spelling-glossary.md](spelling-glossary.md) |
 | Smear cluster identification | research | [smear-cluster-identification.md](smear-cluster-identification.md) |
+| Verifying a repaired transcript | done | [verifying-a-repaired-transcript.md](verifying-a-repaired-transcript.md) |
 
 ## What `done` does and does not promise
 
@@ -66,6 +67,20 @@ shell, and nothing in the suite runs `make` or `setup.sh`:
 - `make pipeline` and `make names` as recipes, like every other `make` target
   here. The `/transcribe` skill in `.claude/skills/` is documentation of the
   running order and is verified by reading it.
+- `GAP-12` — that amplifying an off-mic gap recovers nothing. A measured
+  result on one recording, not a property a test can re-derive: reproducing it
+  means a decode. `GAP-7` … `GAP-11`, the bucketing itself, *are* tested.
+- `DOC-10`'s wiring and `DOC-11`. `readable.py --transcript-only` is covered by
+  `test_readable.py`; the `make readable` pipe that feeds it to Claude is a
+  Makefile recipe, and nothing checks that the summary's cited timestamps
+  resolve to headings in the document it was rendered beside. That check is
+  `DOC-11` and it is run by hand.
+- `REPAIR-15` and `REPAIR-16` — how to read a repaired window. Statements about
+  a reader's judgement rather than about code, so there is nothing to assert.
+- `VERIFY-2` … `VERIFY-7`. `VERIFY-1` is `repair.py verify` and is tested; the
+  rest are checks a person runs against a finished transcript. They are in the
+  spec because each catches something the suite and the repair summary both
+  call clean.
 
 Treat those as documented intent that a change can break without turning the
 suite red. Reviewing them means reading the recipe.

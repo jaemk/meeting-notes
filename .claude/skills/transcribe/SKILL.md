@@ -124,6 +124,15 @@ stay anonymous; that is the designed outcome, not a failure. Report coverage as
 a share of *speech*, not of clusters — the largest ten clusters hold about 80%
 of what was said.
 
+**Read the sidecar before rendering.** It is a handful of lines, and it is the
+last point where a wrong name is cheap to remove. What to look for: a name that
+belongs to no one in this meeting. `naming.md`'s worked example once used a
+plausible full name, and it came back as the answer for a cluster — 164
+paragraphs in the deliverable attributed to a person who is not on the
+recording. The prompt now uses `<…>` placeholders and the quote has to be real,
+so this cannot recur in the same form, but a name that arrives from anywhere
+other than the audio is the failure mode to watch for.
+
 ### 6. Proper nouns the decoder got wrong — free
 
 Whisper spells names it does not know phonetically, and does it
@@ -180,6 +189,30 @@ can be wrong in a way the transcript is not.
 - Neither flag gives the plain document.
 - `NO_SUMMARY=1` assembles the transcript only — no Claude, no cost.
 
+**The summariser is fed `readable.py --transcript-only`, not the raw
+transcript** — the same paragraphs, labels and glossary corrections the reader
+will see. That is why steps 5 and 6 come before this one, and it is not
+cosmetic: piping the bare `.timestamped.txt` in meant Claude summarised an
+unlabelled transcript while the document beneath it carried speakers and names.
+It announced "this transcript is not diarized" directly above a diarized one,
+and cited *segment* times, so four of five of its own cross-references pointed
+at a heading that did not exist.
+
+Nothing else notices that, so check it — the summary's citations must be
+headings that are actually in the document:
+
+    .venv/bin/python - <<'PY'
+    import re, pathlib
+    doc  = pathlib.Path("output/NAME.readable.md").read_text()
+    summ = pathlib.Path("output/NAME.summary.md").read_text()
+    anchors = set(re.findall(r"\*\*\[(\d+:\d\d:\d\d)\]\*\*", doc))
+    cited   = re.findall(r"\[(\d+:\d\d:\d\d)\]", summ)
+    print(sum(c in anchors for c in cited), "of", len(cited), "resolve")
+    PY
+
+Expect all of them. Anything short of that means the summariser read something
+other than the document.
+
 The summary is the piece most likely to be quietly wrong. When reviewing it:
 a figure stated once and revised a minute later means take the last one **and
 say the earlier ones disagreed**. Never smooth over an inconsistency by
@@ -217,14 +250,21 @@ Each of these was measured and cost real time. CLAUDE.md has the numbers.
 - **Amplifying off-mic gaps.** Recovers nothing and duplicates neighbours.
 - **Hand-correcting a spelling in the summary.** It is a glossary entry —
   write it there, or the next re-render silently loses it.
+- **Summarising the raw transcript.** The summariser must read the rendered
+  document or it describes a different one — see step 7.
 
 ## Before you finish
 
-- `make test` — 812 checks across seven suites, decoding stubbed, no model
+- `make test` — 813 checks across seven suites, decoding stubbed, no model
   or network needed.
 - If you changed a committed file, scan it for anything from the recording:
   `grep -ril "<name>" --exclude-dir=.git --exclude-dir=.venv \
    --exclude-dir=local --exclude-dir=output .`
+- **The grep is necessary and not sufficient.** It finds names; it cannot find
+  a paraphrase. A sentence lifted from a real meeting and reworded, with the
+  name blanked, still discloses what was said — `summarize.md` carried one for
+  months as an example of inferring a speaker. Re-read every example you wrote
+  and confirm you invented it rather than softened it.
 - Confirm `output/` and `local/` are still ignored: `git check-ignore -v output/x local/y`
 - A glossary is nothing but real names, so it counts as recording content:
   `git check-ignore -v local/glossary.txt`. Every glossary example in a

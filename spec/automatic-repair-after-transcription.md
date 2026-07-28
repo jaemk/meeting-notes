@@ -59,3 +59,19 @@ satisfied, and would be switched off.
 under two names, with the same default: one is a transcription configuring the
 repair pass it runs, the other is that pass being invoked directly. Neither
 name may drift from the other's meaning.
+
+## AUTO-10
+
+**The seam trim runs first, before any decode.** `trim_seams` is the opening
+step of `diagnose_repair_verify`, and the ordering is load-bearing rather than
+incidental.
+
+Finding an overrun means walking back from the backwards jump to the seam and
+taking everything between them (`SEAM-3`). That span is the overrunning tail
+*only until* a repair has spliced fresh text into it — after which the same
+walk-back deletes the repair's own output. This shipped in the wrong order
+once and left a 14-second hole where a repair had just recovered real speech.
+`test_repair.py` carries a regression test that fails under the old ordering.
+
+Trimming first is also strictly cheaper: a hallucinated tail that has already
+been deleted needs no decode window spent on it.

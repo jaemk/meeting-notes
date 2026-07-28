@@ -23,7 +23,7 @@
 # confirm the same:
 #
 #   .venv/bin/pip freeze  (diff against the block in requirements.txt)
-#   make test             (812 checks across the seven suites, all passing)
+#   make test             (813 checks across the seven suites, all passing)
 #
 # torchaudio 2.8.0 comes in matched to torch 2.8.0. pyannote emits a
 # deprecation warning about torchaudio.list_audio_backends on import; it is
