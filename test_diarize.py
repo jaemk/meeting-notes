@@ -393,4 +393,12 @@ check("a dry run says what it would do and diarizes nothing",
       _r.returncode == 0 and "Would diarize" in _r.stdout, _r.stdout + _r.stderr)
 check("the dry run names the model it would load", D.MODEL in _r.stdout)
 
+_r = cli("run", str(FIXTURE.path), "--dry-run", "-o", "notes")
+check("a bare -o stem resolves into output/, not the cwd",
+      f"writing: {OUTPUT_DIR / 'notes.speakers.json'}" in _r.stdout, _r.stdout)
+
+_r = cli("run", str(FIXTURE.path), "--dry-run", "-o", "notes.json")
+check("an -o already ending .json keeps its extension",
+      f"writing: {OUTPUT_DIR / 'notes.json'}" in _r.stdout, _r.stdout)
+
 check.finish()

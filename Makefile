@@ -116,7 +116,9 @@ help:
 	'  WINDOWS     restrict fix to given stretches, e.g. WINDOWS="-w 20:47-21:09"' \
 	'  GAPS=1      also treat dropped speech as a defect, in check and fix alike' \
 	'  DRY=1       fix previews its windows and decodes nothing' \
-	'  IN_PLACE=1  fix overwrites TRANSCRIPT, keeping a .bak' \
+	'  IN_PLACE=1  fix overwrites TRANSCRIPT, keeping a .bak of each file it rewrites.' \
+	'              A stem carries one generation, so a second in-place fix is refused' \
+	'              rather than allowed to overwrite the first one'"'"'s .bak.' \
 	'  NO_REPAIR=1 transcribe stops after the raw transcription' \
 	'  PRINT=1     analyze runs one-shot and prints its findings instead of opening a session' \
 	'  NO_SUMMARY=1 readable assembles the transcript only — no Claude, no cost' \
@@ -227,7 +229,7 @@ check: $(STAMP)
 #   make fix GAPS=1                           re-decode dropped speech as well
 #   make fix WINDOWS="-w 20:47-21:09"         repair only these stretches
 #   make fix DRY=1                            preview, decode nothing
-#   make fix IN_PLACE=1                       overwrite $(TRANSCRIPT), keeps a .bak
+#   make fix IN_PLACE=1                       overwrite $(TRANSCRIPT), .bak each file
 # FIX_ARGS and WINDOWS are several arguments in one variable, so they are the
 # two expansions here that are deliberately unquoted. They come from whoever
 # ran make, never from a filename.

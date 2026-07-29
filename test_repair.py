@@ -2,6 +2,8 @@ import argparse
 import contextlib
 import io
 import sys
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 from testlib import (Checks, FIXTURE, AUDIO_MIXED, AUDIO_SILENCE, AUDIO_TONE,
@@ -231,8 +233,10 @@ check.section("diagnose_repair_verify: a filled gap does not manufacture a phant
 # the fix it fell back to appending the new material at the end of the list,
 # which left the newly filled gap sorting after a segment that starts long
 # after it — the next scan read that as a rewind on top of the gap it had just
-# filled, so the same window got re-decoded every remaining pass. `main` sorts
-# before writing, so the file on disk looked fine even while this was broken.
+# filled, so the same window got re-decoded every remaining pass. `main` used to
+# sort before writing, so the file on disk looked fine even while this was
+# broken; that sort is gone (SEAM-8), which makes this the only thing standing
+# between a mis-positioned splice and a scrambled transcript.
 gap_synth = [
     {"start": 0.0, "end": 5.0, "text": "some ordinary speech to open things"},
     {"start": 25.0, "end": 30.0, "text": "speech that resumes well after the gap"},
@@ -247,7 +251,8 @@ T.transcribe_window = fills_gap
 gap_opts = R.RepairOptions(backend="mlx", check_audio=False, targets=R.REPAIRABLE_KINDS)
 gap_fixed, gap_report, gap_remaining = R.diagnose_repair_verify(
     None, gap_synth, gap_opts, title="test")
-check("the spliced result comes out in time order, before main's own sort",
+check("the spliced result comes out in time order on its own, with nothing "
+      "downstream to re-sort it",
       all(gap_fixed[i]["start"] <= gap_fixed[i + 1]["start"]
           for i in range(len(gap_fixed) - 1)), gap_fixed)
 check("filling the gap does not manufacture a phantom rewind there",
@@ -910,6 +915,329 @@ check("an impossible gate stops the run before it scans anything",
       "LOOP" not in refused and refuse_code == 1, (refuse_code, refused))
 check("and says which flag it is refusing and why",
       "--ambient-spread-db" in refused and "never negative" in refused, refused)
+
+check.section("the write path keeps the order the repair produced")
+# The transcript a global sort destroys is the one SEAM-4 exists for: a rewind
+# whose seam nothing confirmed. The fixture is exactly that under
+# --no-audio-check — its loop restarts 12s back over speech that was
+# transcribed correctly — and sorting on the way out interleaves the loop
+# line-by-line into the speech underneath it while erasing the backwards jump
+# that is the only evidence anything is wrong (VERIFY-3). A `verify` run
+# afterwards then reports a clean transcript that has been scrambled.
+_real_duration = T.get_duration
+order_stem = T.OUTPUT_DIR / "write-order-check"
+try:
+    T.transcribe_window = lambda *a, **kw: []   # every window comes back empty
+    # Stubbed rather than left to ffprobe: the "recording" passed below is the
+    # transcript itself, and tail_overrun reads a duration before it consults
+    # --no-audio-check. A length past the last segment is the nothing-overran
+    # case, which is what this section wants out of the way.
+    T.get_duration = lambda path: FIXTURE.segments[-1]["end"] + 60.0
+    wrote, wrote_code = run_cli(["repair", str(FIXTURE.path), str(FIXTURE.path),
+                                 "--no-audio-check", "-o", order_stem.name])
+finally:
+    T.transcribe_window = _real_window
+    T.get_duration = _real_duration
+
+loaded = T.load_timestamped(FIXTURE.path)
+written = T.load_timestamped(Path(str(order_stem) + ".timestamped.txt"))
+check("a repair that could splice nothing still writes the transcript out",
+      wrote_code is None and len(written) == len(loaded),
+      (wrote_code, len(written), len(loaded), wrote[-300:]))
+check("and writes it in the order it read it, segment for segment",
+      [(s["start"], s["text"]) for s in written]
+      == [(s["start"], s["text"]) for s in loaded],
+      [s["text"] for s in written[:6]])
+check("the one backwards jump the fixture was built with survives being "
+      "written, so verify can still count it",
+      sum(1 for i in range(1, len(written))
+          if written[i]["start"] < written[i - 1]["start"] - 0.01) == 1,
+      [(i, written[i]["start"]) for i in range(1, len(written))
+       if written[i]["start"] < written[i - 1]["start"] - 0.01])
+buried_at = [i for i, s in enumerate(written) if s["text"] in FIXTURE.duplicated]
+check("the block the rewind buried comes back as one unbroken run, not shuffled "
+      "line-by-line into the loop that covers it",
+      len(buried_at) == len(FIXTURE.duplicated)
+      and buried_at == list(range(buried_at[0], buried_at[0] + len(buried_at))),
+      buried_at)
+check("and a re-scan of the written file still calls the rewind a rewind",
+      any(x.kind == "rewind" for x in R.diagnose(written, None, check_audio=False)),
+      [str(x) for x in R.diagnose(written, None, check_audio=False)])
+
+check.section("--in-place backs up every file it overwrites")
+# save_output rewrites .txt, .timestamped.txt and .srt from one stem, so a
+# backup of only the transcript named on the command line leaves the other two
+# overwritten with nothing to restore them from. What they hold is hours of
+# decoding that re-running the repair does not bring back (COST-7).
+SAID = "the part of the schedule nobody had signed off on"
+BODIES = {
+    ".txt": SAID,
+    ".timestamped.txt": f"[00:00:00.00 --> 00:00:03.00]  {SAID}\n",
+    ".srt": f"1\n00:00:00,000 --> 00:00:03,000\n{SAID}\n\n",
+}
+with tempfile.TemporaryDirectory() as d:
+    stem = Path(d) / "meeting"
+    for ext, body in BODIES.items():
+        Path(str(stem) + ext).write_text(body, encoding="utf-8")
+    made = R.backup_outputs(stem)
+    check("all three renderings are copied, not only the one that was handed in",
+          sorted(p.name for p in made)
+          == sorted("meeting" + ext + ".bak" for ext in BODIES),
+          [p.name for p in made])
+    check("and each copy holds what its original held",
+          all(Path(str(stem) + ext + ".bak").read_text(encoding="utf-8") == body
+              for ext, body in BODIES.items()),
+          {ext: Path(str(stem) + ext + ".bak").read_text(encoding="utf-8")
+           for ext in BODIES})
+with tempfile.TemporaryDirectory() as d:
+    # A stem written under --no-timestamps, or one whose .srt was deleted: a
+    # .bak of a file that is not there would be an empty file claiming to be a
+    # recoverable transcript.
+    stem = Path(d) / "meeting"
+    Path(str(stem) + ".timestamped.txt").write_text(BODIES[".timestamped.txt"],
+                                                    encoding="utf-8")
+    made = R.backup_outputs(stem)
+    check("a sibling that was never written leaves no backup of nothing behind",
+          [p.name for p in made] == ["meeting.timestamped.txt.bak"]
+          and sorted(p.name for p in Path(d).iterdir())
+              == ["meeting.timestamped.txt", "meeting.timestamped.txt.bak"],
+          sorted(p.name for p in Path(d).iterdir()))
+
+# The wiring, not just the helper: --in-place has to reach it before save_output
+# writes over the originals.
+place_stem = T.OUTPUT_DIR / "in-place-backup"
+for ext, body in BODIES.items():
+    Path(str(place_stem) + ext).write_text(body, encoding="utf-8")
+try:
+    T.transcribe_window = lambda *a, **kw: []
+    T.get_duration = lambda path: 600.0
+    placed, placed_code = run_cli(["repair", str(FIXTURE.path),
+                                   str(place_stem) + ".timestamped.txt",
+                                   "--no-audio-check", "--in-place"])
+finally:
+    T.transcribe_window = _real_window
+    T.get_duration = _real_duration
+check("an --in-place run leaves a .bak for each of the three files it rewrote",
+      all(Path(str(place_stem) + ext + ".bak").exists() for ext in BODIES),
+      [ext for ext in BODIES if not Path(str(place_stem) + ext + ".bak").exists()])
+def backed_up(ext):
+    # None rather than an exception for a .bak that is not there: a suite that
+    # tracebacks stops, and the checks after this one are the ones that say
+    # whether the run reported honestly about what it saved.
+    p = Path(str(place_stem) + ext + ".bak")
+    return p.read_text(encoding="utf-8") if p.exists() else None
+check("each of those .bak files still holds what was there before the repair",
+      all(backed_up(ext) == body for ext, body in BODIES.items()),
+      {ext: backed_up(ext) for ext in BODIES})
+check("and the run says what it backed up rather than naming one file",
+      all("in-place-backup" + ext + ".bak" in placed for ext in BODIES),
+      placed[-400:])
+helped, _ = run_cli(["repair", "--help"])
+
+def option_help(text, flag):
+    """
+    What argparse printed as one flag's help: from its entry in the option list
+    to the next entry.
+
+    Anchored on the flag at the start of a line, which is the one place it is
+    an entry rather than a mention — the usage line names every flag, and one
+    flag's help naming another is exactly what a repo that explains its
+    refusals produces. A plain rsplit on the flag would then start the region
+    inside a neighbour's help and read the wrong promise back.
+    """
+    body = text.rsplit("\n  " + flag, 1)[-1]
+    cut = body.find("\n  -")
+    return body if cut < 0 else body[:cut]
+
+in_place_help = option_help(helped, "--in-place")
+check("--in-place promises the backup it actually makes, all three files of it",
+      all(ext in in_place_help for ext in BODIES), in_place_help)
+
+check.section("--in-place and --output name different files, so both is refused")
+# The two flags say contradictory things: --in-place is "overwrite what I passed
+# in", --output is "write somewhere else and leave it alone". Given both, the
+# run used to do half of each — the write went to the --output stem while the
+# .bak was taken of the source, so three files were copied that nothing was
+# about to overwrite and three were overwritten with nothing to restore them
+# from. Both halves look right on their own, which is why nothing complained.
+def refusal(fn, *a, **kw):
+    """What a guard printed on its way out, or "" if it let the call through."""
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        try:
+            fn(*a, **kw)
+        except SystemExit:
+            pass
+    return err.getvalue()
+
+both_flags = refusal(R.check_write_target, True, "somewhere-else")
+check("asking for both stops the run instead of doing half of each",
+      both_flags != "", both_flags)
+check("and the refusal names both flags, not just the one it noticed first",
+      "--in-place" in both_flags and "--output" in both_flags, both_flags)
+check("it says what the pair would have done — backed up files nothing "
+      "overwrites, overwritten files nothing was backed up from",
+      ".bak" in both_flags and "overwritten" in both_flags, both_flags)
+check("--in-place on its own still means overwrite the source",
+      R.check_write_target(True, None) is None)
+check("and --output on its own still means write a fresh stem",
+      R.check_write_target(False, "somewhere-else") is None)
+check("neither of them is the ordinary run, and stays one",
+      R.check_write_target(False, None) is None)
+orphan = refusal(R.check_write_target, False, None, True)
+check("--replace-backup on its own is refused too: nothing else writes a .bak",
+      "--replace-backup" in orphan and "--in-place" in orphan, orphan)
+check("but it is exactly what --in-place is for",
+      R.check_write_target(True, None, True) is None)
+
+contradiction = T.OUTPUT_DIR / "contradiction"
+# Cleared first, because the thing being asserted is an absence: a stem left
+# behind by an earlier run of this suite — or by a run of it against a build
+# that still wrote one — would otherwise read as this run having written it.
+for _leftover in T.OUTPUT_DIR.glob("contradiction.*"):
+    _leftover.unlink()
+decoded.clear()
+try:
+    T.transcribe_window = clean_window
+    both_out, both_code = run_cli(["repair", str(FIXTURE.path), str(FIXTURE.path),
+                                   "--no-audio-check", "--in-place",
+                                   "-o", contradiction.name])
+finally:
+    T.transcribe_window = _real_window
+check("the CLI refuses the pair rather than writing one and backing up the other",
+      both_code == 1, (both_code, both_out[-300:]))
+check("and refuses before it has read a transcript or spent a decode",
+      decoded == [] and "Loaded" not in both_out, (decoded, both_out[-300:]))
+check("so nothing lands at the stem it was told to write to",
+      not Path(str(contradiction) + ".timestamped.txt").exists())
+
+check.section("a second --in-place repair does not overwrite the first one's .bak")
+# T.backup_file writes <file>.bak unconditionally, so two in-place runs in a row
+# put run one's *repaired* output where the original decode was. What is lost is
+# not an edit but hours of compute nothing short of the audio can produce again
+# (COST-8), given up by a command spelled exactly like the one that saved it.
+with tempfile.TemporaryDirectory() as d:
+    stem = Path(d) / "meeting"
+    for ext, body in BODIES.items():
+        Path(str(stem) + ext).write_text(body, encoding="utf-8")
+    check("a stem nobody has repaired in place has no backup to lose",
+          R.existing_backups(stem) == [] and R.check_backup_generation(stem) is None,
+          R.existing_backups(stem))
+    R.backup_outputs(stem)
+    check("after one in-place repair every rendering has a backup standing behind it",
+          sorted(p.name for p in R.existing_backups(stem))
+          == sorted("meeting" + ext + ".bak" for ext in BODIES),
+          [p.name for p in R.existing_backups(stem)])
+    second = refusal(R.check_backup_generation, stem)
+    check("so the next one is refused rather than allowed to copy over them",
+          second != "", second)
+    check("the refusal names the backups it is standing in front of",
+          all("meeting" + ext + ".bak" in second for ext in BODIES), second)
+    check("and offers both ways past it: write elsewhere, or say you meant it",
+          "--output" in second and "--replace-backup" in second, second)
+    check("--replace-backup is what lets the run through",
+          R.check_backup_generation(stem, True) is None)
+    Path(str(stem) + ".srt").unlink()
+    check("a .bak whose own file is gone is in no danger from this run, so it "
+          "does not block one either",
+          all(p.name != "meeting.srt.bak" for p in R.existing_backups(stem)),
+          [p.name for p in R.existing_backups(stem)])
+    check("and the run would not have copied anything over it",
+          [src.name for src, _ in R.backup_pairs(stem)]
+          == ["meeting.txt", "meeting.timestamped.txt"],
+          [src.name for src, _ in R.backup_pairs(stem)])
+
+# The wiring, and the case the guard exists for: two in-place repairs of the
+# same stem, the first of which really does change the files.
+twice_stem = T.OUTPUT_DIR / "in-place-twice"
+LOOPED = ([{"start": float(i), "end": float(i + 1), "text": "stuck line"}
+           for i in range(5)]
+          + [{"start": 5.0, "end": 8.0,
+              "text": "and the meeting carried on from there"}])
+
+def write_looped():
+    """Plant a defective transcript, as three renderings, and read them back."""
+    with contextlib.redirect_stdout(io.StringIO()):    # save_output's own chatter
+        T.save_output({"text": T.rebuild_text(LOOPED), "segments": LOOPED},
+                      twice_stem, True)
+    return {ext: Path(str(twice_stem) + ext).read_text(encoding="utf-8")
+            for ext in BODIES}
+
+def repair_twice_stem(*extra):
+    try:
+        T.transcribe_window = clean_window
+        T.get_duration = lambda path: 600.0
+        return run_cli(["repair", str(FIXTURE.path),
+                        str(twice_stem) + ".timestamped.txt",
+                        "--no-audio-check", "--in-place"] + list(extra))
+    finally:
+        T.transcribe_window = _real_window
+        T.get_duration = _real_duration
+
+def backups_now():
+    return {ext: Path(str(twice_stem) + ext + ".bak").read_text(encoding="utf-8")
+            if Path(str(twice_stem) + ext + ".bak").exists() else None
+            for ext in BODIES}
+
+for _leftover in T.OUTPUT_DIR.glob("in-place-twice.*"):
+    _leftover.unlink()          # this stem's .bak is what the run below asserts on
+decoded.clear()
+decode_original = write_looped()
+first_out, first_code = repair_twice_stem()
+check("the first in-place repair runs and leaves a .bak of each file it rewrote",
+      first_code is None and backups_now() == decode_original,
+      (first_code, first_out[-300:]))
+check("and it really did change them, so the .bak is the only copy of what "
+      "the decode produced",
+      Path(str(twice_stem) + ".timestamped.txt").read_text(encoding="utf-8")
+      != decode_original[".timestamped.txt"],
+      Path(str(twice_stem) + ".timestamped.txt").read_text(encoding="utf-8"))
+
+second_out, second_code = repair_twice_stem()
+check("a second in-place repair over the same stem is refused",
+      second_code == 1, (second_code, second_out[-300:]))
+check("and refused before the transcript is loaded, let alone decoded",
+      "Loaded" not in second_out, second_out[-300:])
+check("so the pre-repair decode is still in the .bak rather than this run's input",
+      backups_now() == decode_original,
+      {ext: v[:60] for ext, v in backups_now().items() if v})
+check("the refusal says which file stopped it and what it holds",
+      "in-place-twice.timestamped.txt.bak" in second_out
+      and "decode" in second_out, second_out[-400:])
+
+replaced_out, replaced_code = repair_twice_stem("--replace-backup")
+check("--replace-backup lets the same run through",
+      replaced_code is None, (replaced_code, replaced_out[-300:]))
+check("the older copy really is gone, which is what was asked for",
+      backups_now() != decode_original,
+      {ext: v[:60] for ext, v in backups_now().items() if v})
+check("and the run says so out loud instead of reporting a backup as usual",
+      "Replaced the backup" in replaced_out
+      and "in-place-twice.timestamped.txt.bak" in replaced_out,
+      replaced_out[-400:])
+
+before_dry = backups_now()
+dry_out, dry_code = repair_twice_stem("--dry-run")
+check("a dry run is not made to argue about a backup it never takes",
+      dry_code == 0 and "Dry run" in dry_out, (dry_code, dry_out[-300:]))
+check("and having been let through it still writes and backs up nothing",
+      backups_now() == before_dry, (before_dry, backups_now()))
+
+replace_help = option_help(helped, "--replace-backup")
+check("--replace-backup says what it gives up, not just what it permits",
+      "decode" in replace_help and ".bak" in replace_help, replace_help)
+check("--in-place says the backup is one generation and points at the override",
+      "--replace-backup" in in_place_help, in_place_help)
+check("and the two are read apart, so neither promise is being checked against "
+      "the other flag's text",
+      "Overwrite the source transcript" in in_place_help
+      and "Overwrite the source transcript" not in replace_help,
+      (in_place_help, replace_help))
+check("the backup keeps the .bak name .gitignore and `make clean` both match, "
+      "so no generation of it is committable or survives a clean",
+      [bak.name for _, bak in R.backup_pairs(place_stem)]
+      == ["in-place-backup" + ext + ".bak" for ext in BODIES],
+      [bak.name for _, bak in R.backup_pairs(place_stem)])
 
 check.section("a missing file and an impossible threshold stop the run")
 check.raises("a transcript that is not there stops instead of tracebacking",

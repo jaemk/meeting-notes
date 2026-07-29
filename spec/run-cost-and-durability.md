@@ -56,3 +56,41 @@ documented way to find out what a repair would spend before spending it.
 `-c 1`, which `make` passes, is a stated trade rather than a tuning detail: it
 is what keeps Whisper from looping, and it multiplies the number of chunk
 extractions. Documentation that recommends it also says what it costs.
+
+## COST-7
+
+`--in-place` backs up **every file it overwrites**, not just the one named on
+the command line. A repair rewrites all three renderings from one stem (`.txt`,
+`.timestamped.txt`, `.srt`, per `FILES-5`), so a `.bak` of the transcript alone
+leaves the other two overwritten with nothing to restore them from. What they
+hold is hours of decoding, and re-running the repair does not bring it back: the
+input it would need is the file that was just overwritten. The `.bak` is the
+whole of the recovery story here, which is why the flag's help states what it
+copies rather than promising "a .bak".
+
+Only the siblings that exist are copied. A `.bak` of a file that was never
+written is an empty file that reads as a recoverable transcript.
+
+## COST-8
+
+The pre-repair transcript is worth protecting from the *second* in-place run,
+not only from the first.
+
+`COST-5` calls a repair the cheap, restartable half because its input is
+already on disk. That is the whole of the argument, and it holds only while the
+input is still there. A repair costs a handful of windows; the transcript it
+edits cost the decode — `COST-1` and `COST-2`, hours of compute on a long
+recording — and the audio is the only thing it can be made from again. Once a
+second `--in-place` run has copied the first one's output over the `.bak`, the
+undo is not a restore, it is a re-transcription.
+
+So a repair that would overwrite an existing backup stops, before it loads the
+transcript and long before it decodes anything (`FILES-12`). A refusal raised
+where the backup is actually taken — after the repair has run — would already
+have spent the decodes it exists to protect, which is the same ordering
+argument `AUTO-10` makes about the seam trim.
+
+Overriding it is allowed and is reported. `--replace-backup` names the backups
+it replaced and says what they held, because the danger was never the overwrite
+itself: it is a command that destroys the only copy of an afternoon's decoding
+and prints "Backed up original" as it goes.

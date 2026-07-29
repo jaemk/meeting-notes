@@ -178,6 +178,10 @@ _r2 = cli(str(_bad))
 check("checking a bad one fails loudly instead of being ignored",
       _r2.returncode != 0 and "Refusing" in (_r2.stdout + _r2.stderr),
       _r2.stdout + _r2.stderr)
+_r2b = cli(str(OUTPUT_DIR / "glossary-does-not-exist.txt"))
+check("a path that does not exist is refused the same way, not a traceback",
+      _r2b.returncode != 0 and "Refusing" in (_r2b.stdout + _r2b.stderr),
+      _r2b.stdout + _r2b.stderr)
 
 _t = OUTPUT_DIR / "glossary-test.timestamped.txt"
 _t.write_text("[00:00:00.00 --> 00:00:02.00]  Ren Ashbee spoke\n"

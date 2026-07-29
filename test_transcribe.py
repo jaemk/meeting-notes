@@ -53,6 +53,33 @@ with contextlib.redirect_stderr(io.StringIO()):   # it warns; that is its own se
           T.resolve_output("elsewhere/audio") == Path("elsewhere/audio"))
 check("resolve_output strips a transcript extension",
       T.resolve_output("audio.timestamped.txt") == T.OUTPUT_DIR / "audio")
+# The other half of FILES-11. transcribe.py --output and repair.py -o name a
+# stem that save_output appends three extensions to; readable.py, diarize.py and
+# names.py --output name the finished file. Stripping the extension off the
+# second kind renames the file, so the two have separate resolvers rather than
+# one with a mode flag, and both are checked here so neither can drift onto the
+# other's rule.
+check("a bare output filename lands in output/ too",
+      T.resolve_output_file("notes.readable.md") == T.OUTPUT_DIR / "notes.readable.md",
+      T.resolve_output_file("notes.readable.md"))
+check("a file named .txt keeps its .txt, where a stem would have lost it",
+      T.resolve_output_file("notes.txt") == T.OUTPUT_DIR / "notes.txt"
+      and T.resolve_output("notes.txt") == T.OUTPUT_DIR / "notes",
+      (T.resolve_output_file("notes.txt"), T.resolve_output("notes.txt")))
+check("and so does a file named .srt or .timestamped.txt, the other two the "
+      "stem resolver exists to strip",
+      (T.resolve_output_file("notes.srt"),
+       T.resolve_output_file("notes.timestamped.txt"))
+      == (T.OUTPUT_DIR / "notes.srt", T.OUTPUT_DIR / "notes.timestamped.txt"))
+check("a name with no extension at all is left with none",
+      T.resolve_output_file("notes") == T.OUTPUT_DIR / "notes")
+with contextlib.redirect_stderr(io.StringIO()):   # it warns; that is its own section
+    check("an explicit directory is honoured for a file name as well",
+          T.resolve_output_file("elsewhere/notes.readable.md")
+          == Path("elsewhere/notes.readable.md"))
+    check("dots inside a name are not an extension to a file resolver either",
+          T.resolve_output_file("team.sync.2026-07-25.readable.md")
+          == T.OUTPUT_DIR / "team.sync.2026-07-25.readable.md")
 check("a bare transcript name is found in output/",
       T.resolve_transcript(FIXTURE.path.name) == FIXTURE.path,
       T.resolve_transcript(FIXTURE.path.name))
@@ -774,6 +801,111 @@ with contextlib.redirect_stderr(io.StringIO()):
           T.warn_if_committable(ROOT / "notes" / "x") is True
           and T.warn_if_committable(T.OUTPUT_DIR / "x") is False)
 
+# The file resolver runs the same guard, because the documents the later stages
+# write are as committable as a transcript is — a .readable.md carries the whole
+# meeting in it.
+def resolved_file(name):
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        return T.resolve_output_file(name), err.getvalue()
+doc_inside = str(ROOT / "documents" / "meeting.readable.md")
+doc_path, doc_warned = resolved_file(doc_inside)
+check("a document written into the repo but outside output/ is honoured and "
+      "called out, exactly as a transcript stem is",
+      str(doc_path) == doc_inside and "Warning" in doc_warned
+      and "gitignore" in doc_warned, (doc_path, doc_warned))
+check("a bare document name is silent, because it lands in output/",
+      resolved_file("meeting.readable.md")
+      == (T.OUTPUT_DIR / "meeting.readable.md", ""),
+      resolved_file("meeting.readable.md"))
+check("naming output/ explicitly is silent for a file too",
+      resolved_file(str(T.OUTPUT_DIR / "meeting.readable.md"))[1] == "",
+      resolved_file(str(T.OUTPUT_DIR / "meeting.readable.md")))
+with tempfile.TemporaryDirectory() as d:
+    check("and somewhere else entirely on the disk is the author's own business "
+          "for a document as much as for a stem",
+          resolved_file(str(Path(d) / "meeting.readable.md"))[1] == "",
+          resolved_file(str(Path(d) / "meeting.readable.md")))
+
+check.section("resolve_output_file's edges: empty, '..', trailing slash, and ~")
+# An empty --output has one part (Path("") is Path(".")) and is not absolute,
+# so before this it fell to the bare-name branch: OUTPUT_DIR / "" is OUTPUT_DIR
+# itself, a directory path handed back where a file was asked for — the same
+# failure need_output's Makefile guard exists to catch before a stem ever
+# reaches save_output.
+check.raises("an empty --output is refused rather than silently resolving to "
+             "output/ itself",
+             T.resolve_output_file, "", expect=ValueError)
+check.raises("a bare '..' is refused too — with no directory component to "
+             "route it through the warn_if_committable check every other "
+             "escape from output/ goes through, OUTPUT_DIR / '..' would "
+             "silently walk back out to OUTPUT_DIR's parent",
+             T.resolve_output_file, "..", expect=ValueError)
+check.raises("a trailing slash on a bare name is refused — 'notes/' names a "
+             "directory, not the file this resolves to",
+             T.resolve_output_file, "notes/", expect=ValueError)
+check.raises("and so does 'output/' itself — the exact output/.summary.md "
+             "trap the Makefile's need_output guard already refuses a stem "
+             "for, one level lower",
+             T.resolve_output_file, "output/", expect=ValueError)
+with contextlib.redirect_stderr(io.StringIO()):
+    check("'../escape.md' does have a directory component ('..', "
+          "'escape.md'), so it is honoured as typed rather than refused — "
+          "only a bare name with nothing left to call a file is",
+          T.resolve_output_file("../escape.md") == Path("../escape.md"))
+
+# warn_if_committable judges a ~-expanded copy of whatever it is handed, but
+# the path resolve_output_file returned was the unexpanded one — so whether
+# the warning's verdict and the path actually written to agreed depended on
+# where ~ happened to point. Pointing $HOME at a path inside the repo (never
+# created on disk — resolve_output_file only builds a Path, it never touches
+# the filesystem) makes that disagreement concrete: the returned path must be
+# the expanded one, and must be judged for the warning on that same path.
+_real_home = os.environ.get("HOME")
+try:
+    os.environ["HOME"] = str(ROOT / "documents")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        got = T.resolve_output_file("~/meeting.readable.md")
+    check("a ~ in a --output is expanded in the path handed back, not left "
+          "for the caller to expand a second time",
+          got == ROOT / "documents" / "meeting.readable.md", got)
+    check("...and it is judged for the warning on that same expanded path, "
+          "so the two can no longer disagree",
+          "Warning" in err.getvalue(), err.getvalue())
+finally:
+    if _real_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = _real_home
+
+check.section("a refused --output reaches the user as a sentence, not a traceback")
+# resolve_output_file raises so a caller can handle the refusal; every CLI that
+# calls it wants the other thing — readable.py, diarize.py and names.py all
+# turn a bad path into an exit, the way prompt.py does for a template it cannot
+# read. The wrapper is what they share, so the message is written once.
+check.raises("a directory handed to a CLI exits rather than raising, so the "
+             "user gets a sentence instead of a stack trace",
+             T.resolve_output_file_arg, "notes/", expect=SystemExit)
+try:
+    T.resolve_output_file_arg("notes/")
+except SystemExit as e:
+    check("the exit carries the refusal itself, so nothing has to restate it",
+          "must name a file" in str(e) and "notes/" in str(e), str(e))
+# The same rule serves --output, --speakers and --names. A refusal that always
+# said "--output" would send someone to a flag they never typed.
+for _flag in ("--speakers", "--names"):
+    try:
+        T.resolve_output_file_arg("sidecars/", _flag)
+    except SystemExit as e:
+        check(f"a refusal names {_flag}, the flag the value actually arrived on",
+              str(e).startswith(_flag), str(e))
+with contextlib.redirect_stderr(io.StringIO()):
+    check("a good path is returned unchanged, so the wrapper only differs from "
+          "resolve_output_file when it refuses",
+          T.resolve_output_file_arg("notes.readable.md")
+          == T.resolve_output_file("notes.readable.md"))
+
 check.section("transcript files are UTF-8 whatever the locale says")
 # Whisper output routinely contains non-ASCII, and backup_file round-trips a
 # whole transcript through a decode and an encode — under a non-UTF-8 locale a
@@ -812,6 +944,64 @@ else:
           "interpreter whose locale encoding is ASCII",
           r.returncode == 0 and r.stdout.strip().endswith("OK"),
           (r.stdout[-200:], r.stderr[-400:]))
+
+check.section("the repaired transcript is written in the order repair returned")
+if _repair is None:
+    check.skip("main writes the repaired segments in the order repair returned",
+               "repair.py not importable here")
+else:
+    # main() writes twice: once for the raw transcription and again if the repair
+    # spliced anything. That second write used to sort the segments first — a
+    # no-op on everything the merge produces, since clamp_to_chunk makes a rewind
+    # impossible in a fresh transcript (MERGE-2, MERGE-3), and destructive on a
+    # repair that handed one back anyway: it shuffles the rewound block
+    # line-by-line into the speech underneath it and erases the backwards jump
+    # that is the only evidence of it (SEAM-8, VERIFY-3). Nothing decodes and
+    # nothing is written here: transcribe and the repair cycle are stubbed and
+    # save_output is a recorder, so this is the wiring alone.
+    rewound = [
+        {"start": 100.0, "end": 106.0, "text": "the sentence that was really there"},
+        {"start": 106.0, "end": 112.0, "text": "and the one that followed it"},
+        {"start": 112.0, "end": 118.0, "text": "the last thing said before the seam"},
+        {"start": 106.0, "end": 109.0, "text": "the overrun tail, restamped backwards"},
+        {"start": 109.0, "end": 112.0, "text": "still the overrun tail"},
+        {"start": 118.0, "end": 124.0, "text": "what the next chunk actually heard"},
+    ]
+    saved = []
+    _real_transcribe, _real_save = T.transcribe, T.save_output
+    _real_cycle = _repair.diagnose_repair_verify
+    _argv_was = sys.argv
+    try:
+        T.transcribe = lambda *a, **kw: {
+            "text": " ".join(s["text"] for s in rewound),
+            "segments": [dict(s) for s in rewound],
+        }
+        T.save_output = lambda result, path, stamps: saved.append(result["segments"])
+        # Hands back what it was given, with a report row that says a window was
+        # spliced — which is the only condition under which main writes twice.
+        _repair.diagnose_repair_verify = lambda audio, segs, opts, **kw: (
+            segs, [((100.0, 124.0), "repaired", True, 12, 12)], [])
+        # FIXTURE.path is passed only because it exists and has a directory
+        # component; no byte of it is read, since transcribe never runs.
+        sys.argv = ["transcribe.py", str(FIXTURE.path)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            T.main()
+    finally:
+        T.transcribe, T.save_output = _real_transcribe, _real_save
+        _repair.diagnose_repair_verify = _real_cycle
+        sys.argv = _argv_was
+
+    check("a repair that spliced something rewrites the files, so what is on "
+          "disk is the repaired transcript", len(saved) == 2, len(saved))
+    check("and that second write is the order the repair returned, segment for "
+          "segment, with nothing re-sorting it on the way out",
+          [s["text"] for s in saved[-1]] == [s["text"] for s in rewound],
+          [s["text"] for s in saved[-1]])
+    check("so a backwards jump the repair could not confirm reaches the file, "
+          "where verify counts it, instead of being tidied away",
+          sum(1 for i in range(1, len(saved[-1]))
+              if saved[-1][i]["start"] < saved[-1][i - 1]["start"] - 0.01) == 1,
+          [s["start"] for s in saved[-1]])
 
 check.section("the harness protects itself")
 # Both of these guard the harness rather than transcribe.py, and both were

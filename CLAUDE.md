@@ -84,7 +84,7 @@ when they are got wrong.
   with the name blanked as an example of inferring a speaker. A grep for names
   will not find that. Invent the example instead.
 - **Say what a decode costs before running it**, and prefer `--dry-run` first.
-  `COST-1` … `COST-6`.
+  `COST-1` … `COST-8`.
 
 ## Already tried, already ruled out
 
@@ -130,7 +130,7 @@ Two orderings are load-bearing and have each shipped broken once:
 
 ## Tests
 
-    make test        # 813 checks, decoding stubbed, no model or network:
+    make test        # 931 checks, decoding stubbed, no model or network:
                      #   test_transcribe.py  test_repair.py   test_readable.py
                      #   test_prompt.py      test_diarize.py  test_names.py
                      #   test_glossary.py

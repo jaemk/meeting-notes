@@ -255,7 +255,7 @@ Each of these was measured and cost real time. CLAUDE.md has the numbers.
 
 ## Before you finish
 
-- `make test` — 813 checks across seven suites, decoding stubbed, no model
+- `make test` — 931 checks across seven suites, decoding stubbed, no model
   or network needed.
 - If you changed a committed file, scan it for anything from the recording:
   `grep -ril "<name>" --exclude-dir=.git --exclude-dir=.venv \

@@ -79,6 +79,42 @@ check("the summary note tracks whether speakers were labelled",
       and "speakers are not labelled" in
       Rd.render(turn_segs, "meeting", "It happened."))
 
+check.section("the naming caveat comes from an explicit flag, not a sniffed label")
+# diarize.one_label renders a non-numeric cluster id as "Robin (SPEAKER_MAIN)"
+# — no "(Speaker " substring — so sniffing the rendered label for that
+# substring would call this document unnamed. render() must not do that when
+# told the truth explicitly.
+odd_cluster_marked = [(0.0, "asking the question", "Robin (SPEAKER_MAIN)"),
+                      (2.1, "answering it", "Speaker 2")]
+odd_named_doc = Rd.render(turn_segs, "meeting", "It happened.",
+                          paras=odd_cluster_marked, named=True)
+check("a non-numeric cluster id carrying a name still gets the named caveat",
+      "speaker names are inferred" in odd_named_doc, odd_named_doc)
+check("and not the 'acoustic clusters, not names' caveat a sniff would give it",
+      "acoustic clusters, not names" not in odd_named_doc, odd_named_doc)
+check("the transcript note says the same thing",
+      "Names in brackets were inferred" in odd_named_doc, odd_named_doc)
+
+# The same paragraphs, un-told: this is the defect the explicit flag exists to
+# avoid, kept here as a demonstration of why the fallback is only best-effort
+# and documented as such rather than trusted.
+odd_sniffed_doc = Rd.render(turn_segs, "meeting", "It happened.",
+                            paras=odd_cluster_marked)
+check("without the flag, sniffing the same paragraphs is fooled by the "
+      "non-numeric id",
+      "acoustic clusters, not names" in odd_sniffed_doc, odd_sniffed_doc)
+
+# The other direction: a label that *looks* named to a sniff ("(Speaker " is
+# present) but the caller explicitly says it is not. named= overrides the
+# sniff either way, because it is the truth and the label text is not.
+lying_label = [(0.0, "asking the question", "Robin (Speaker 7)"),
+              (2.1, "answering it", "Speaker 2")]
+override_doc = Rd.render(turn_segs, "meeting", "It happened.",
+                         paras=lying_label, named=False)
+check("an explicit named=False is honoured even over a label that reads as named",
+      "acoustic clusters, not names" in override_doc
+      and "speaker names are inferred" not in override_doc, override_doc)
+
 check.section("the clock is written for reading, not sorting")
 check("hours are unpadded and minutes and seconds are",
       Rd.fmt_clock(3 * 3600 + 4 * 60 + 5) == "3:04:05", Rd.fmt_clock(11045))
@@ -177,6 +213,21 @@ check("a bare --output name is also written into output/, not the cwd",
 if (OUTPUT_DIR / output_name).exists():
     check("the resolved summary made it into the document",
           "It happened." in (OUTPUT_DIR / output_name).read_text())
+
+# -o names the finished file, not a stem — resolve_output would strip the
+# .txt off "notes.txt" and silently write an extensionless "output/notes"
+# (LOW-1). resolve_output_file leaves the extension exactly as given.
+notes_txt_name = "readable-cli-test-notes.txt"
+(OUTPUT_DIR / notes_txt_name).unlink(missing_ok=True)
+# Also cleared: the stripped name a bug (or a previous, unfixed run) would
+# have written instead, so a leftover from that never masquerades as a pass.
+(OUTPUT_DIR / "readable-cli-test-notes").unlink(missing_ok=True)
+notes_exit = run_main([transcript_name, "-o", notes_txt_name])
+check("-o notes.txt writes output/notes.txt, extension intact",
+      notes_exit is None and (OUTPUT_DIR / notes_txt_name).exists(),
+      (notes_exit, list(OUTPUT_DIR.glob("readable-cli-test-notes*"))))
+check("and not the stripped, extensionless output/notes",
+      not (OUTPUT_DIR / "readable-cli-test-notes").exists())
 
 check.section("--speakers on the command line")
 speakers_name = "readable-cli-test.speakers.json"
@@ -363,5 +414,248 @@ check("a malformed transcript line exits cleanly instead of raising ValueError",
 if isinstance(bad_exit, str):
     check("the clean error names the file that failed to parse",
           bad_name in bad_exit, bad_exit)
+
+check.section("the summary's timestamps are checked against the headings that exist")
+# The defect this measures shipped: the summary was written from the raw
+# .timestamped.txt, so it cited *segment* times, and only 20% of them were
+# paragraph headings in the finished document — four out of five of its own
+# cross-references pointed at a heading that was not there (DOC-10). Both
+# halves are in hand at assembly time, so the check is free; DOC-13 is why it
+# reports rather than refuses.
+anchor_paras = [(0.0, "how the meeting opened"),
+                (754.0, "the middle bit"),
+                (3725.0, "and how it ended")]
+anchor_clocks = [Rd.fmt_clock(p[0]) for p in anchor_paras]
+cited_summary = "\n".join([
+    "## Executive summary",
+    "",
+    f"It opened at **[{anchor_clocks[0]}]** and ran long.",
+    f"The decision was taken at [{anchor_clocks[1]}], revisited at "
+    f"[{anchor_clocks[1]}], and closed at `[{anchor_clocks[2]}]`.",
+    "Rounded off, that first one is [0:12:30], and padded it is [00:12:34].",
+    "See also [the Thornbury Cove notes](notes.md), which are not a citation.",
+])
+cited, missing = Rd.cited_anchors(cited_summary, anchor_paras)
+check("a citation is found however the markdown wraps it — bare, bold or in "
+      "backticks",
+      all(c in cited for c in anchor_clocks), cited)
+check("a timestamp cited twice counts once, since it names one place to look",
+      cited.count(anchor_clocks[1]) == 1, cited)
+check("text in brackets that is not a clock is not a citation",
+      len(cited) == len(anchor_clocks) + 2, cited)
+check("the three real ones resolve, and only the two bad ones are reported "
+      "missing",
+      not any(c in missing for c in anchor_clocks) and len(missing) == 2,
+      missing)
+check("a rounded citation resolves to nothing, because the reader's search "
+      "for it will too",
+      "0:12:30" in missing, missing)
+check("and a padded hour is not the heading transcript_lines writes either",
+      "00:12:34" in missing, missing)
+anchor_only = "\n".join(Rd.transcript_lines(anchor_paras))
+check("what it compares against is exactly the anchors transcript_lines "
+      "renders, so the two cannot drift",
+      bool(cited) and bool(missing)
+      and all(f"**[{c}]**" in anchor_only for c in cited if c not in missing)
+      and all(f"**[{c}]**" not in anchor_only for c in missing), anchor_only)
+check("a summary citing nothing reports nothing, not a perfect score",
+      Rd.cited_anchors("It happened, at no stated time.", anchor_paras)
+      == ([], []))
+check("an absent summary is handled without raising",
+      Rd.cited_anchors(None, anchor_paras) == ([], []))
+
+# A transcript whose paragraphs are known one per planted start: 3s of speech
+# every 10s, so the 7s between them is well past PARAGRAPH_PAUSE. Ten of them,
+# which is what makes a share rather than a count testable.
+from contextlib import redirect_stderr
+
+anchor_starts = [i * 10.0 for i in range(10)]
+anchor_tx = "readable-anchor-test.timestamped.txt"
+anchor_out = "readable-anchor-test.readable.md"
+(OUTPUT_DIR / anchor_tx).write_text("".join(
+    f"[00:{int(s) // 60:02d}:{int(s) % 60:02d}.00 --> "
+    f"00:{int(s + 3) // 60:02d}:{int(s + 3) % 60:02d}.00]  "
+    f"the {i}th thing anyone said\n"
+    for i, s in enumerate(anchor_starts)))
+real_anchors = [Rd.fmt_clock(s) for s in anchor_starts]
+check("the anchor fixture really is one paragraph per planted start",
+      len(Rd.paragraphs(T.load_timestamped(OUTPUT_DIR / anchor_tx)))
+      == len(anchor_starts),
+      len(Rd.paragraphs(T.load_timestamped(OUTPUT_DIR / anchor_tx))))
+# Deliberately not multiples of ten: none of these is a heading in that file.
+bogus_anchors = ["0:00:05", "0:00:07", "0:00:13", "0:00:21", "0:00:34",
+                 "0:00:47", "0:01:11", "0:01:47"]
+
+
+def write_anchor_summary(name, good, bogus):
+    """A summary citing `good` headings and `bogus` places that are not."""
+    body = ["## Executive summary", "", "Something was decided.", ""]
+    body += [f"- a point worth finding, at `[{c}]`" for c in good + bogus]
+    (OUTPUT_DIR / name).write_text("\n".join(body) + "\n")
+    return name
+
+
+def run_main_captured(argv):
+    """
+    main()'s exit code, stdout and stderr. Both streams are needed because the
+    count and the warning deliberately go to different ones — a redirected
+    stdout must not swallow the warning.
+    """
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = run_main(argv)
+    return code, out.getvalue(), err.getvalue()
+
+
+all_good = write_anchor_summary("readable-anchor-all.summary.md",
+                                real_anchors, [])
+good_exit, good_out, good_err = run_main_captured(
+    [anchor_tx, "--summary", all_good, "-o", anchor_out])
+check("a healthy document reports every cited timestamp resolving",
+      good_exit is None
+      and f"{len(real_anchors)} of {len(real_anchors)}" in good_out, good_out)
+check("and says what the number means, rather than printing a bare ratio",
+      "resolve to a paragraph heading" in good_out, good_out)
+check("a document whose citations all land warns about nothing",
+      good_err == "", good_err)
+check("the count stays on the console — the reader's document carries the "
+      "caveat about the summary, not a statistic about it",
+      "resolve to a paragraph heading" not in
+      (OUTPUT_DIR / anchor_out).read_text()
+      and "Summary anchors" not in (OUTPUT_DIR / anchor_out).read_text())
+
+# Nine of ten: one anchor gone stale in a hand-edited summary is a typo, not
+# the wiring failure, and must not cry wolf. This pins ANCHOR_WARN at or below
+# 0.9.
+nine = write_anchor_summary("readable-anchor-nine.summary.md",
+                            real_anchors[:-1], bogus_anchors[:1])
+nine_exit, nine_out, nine_err = run_main_captured(
+    [anchor_tx, "--summary", nine, "-o", anchor_out])
+check("nine citations in ten landing is reported plainly",
+      nine_exit is None and f"9 of {len(real_anchors)}" in nine_out, nine_out)
+check("and is not warned about — one stale anchor is a typo, not a defect in "
+      "how the summary was written",
+      nine_err == "", nine_err)
+
+# Eight of ten: the other side of the threshold, so the two checks together
+# pin it between 0.8 and 0.9 rather than merely asserting it is somewhere.
+eight = write_anchor_summary("readable-anchor-eight.summary.md",
+                             real_anchors[:-2], bogus_anchors[:2])
+eight_exit, eight_out, eight_err = run_main_captured(
+    [anchor_tx, "--summary", eight, "-o", anchor_out])
+check("eight in ten is materially below all of them, and is warned about",
+      eight_exit is None and "WARNING" in eight_err, (eight_out, eight_err))
+
+# The measured failure itself: two citations in ten, the 20% the summary
+# written from the raw transcript scored.
+raw_like = write_anchor_summary("readable-anchor-raw.summary.md",
+                                real_anchors[:2], bogus_anchors)
+raw_exit, raw_out, raw_err = run_main_captured(
+    [anchor_tx, "--summary", raw_like, "-o", anchor_out])
+check("the 20% case that shipped is caught",
+      raw_exit is None and "WARNING" in raw_err, (raw_out, raw_err))
+check("the warning names timestamps the reader would have searched for in vain",
+      f"[{bogus_anchors[0]}]" in raw_err, raw_err)
+check("and says how to fix it, since the summary is what has to be rebuilt",
+      "--transcript-only" in raw_err, raw_err)
+check("a poor score is reported, never enforced: the document is still written",
+      (OUTPUT_DIR / anchor_out).exists()
+      and "Something was decided." in (OUTPUT_DIR / anchor_out).read_text()
+      and "the 0th thing anyone said" in (OUTPUT_DIR / anchor_out).read_text())
+check("the exit code stays clean, so `make readable` does not lose the "
+      "summary it paid for",
+      raw_exit is None, raw_exit)
+
+# Without a summary there is nothing to cite and nothing to say about it.
+plain_exit, plain_out, plain_err = run_main_captured(
+    [anchor_tx, "-o", anchor_out])
+check("a document with no summary reports no anchor count at all",
+      plain_exit is None and "Summary anchors" not in plain_out
+      and plain_err == "", (plain_out, plain_err))
+
+# A summary that cites nothing is its own signal, and still not an error.
+(OUTPUT_DIR / "readable-anchor-none.summary.md").write_text(
+    "## Executive summary\n\nIt happened, at no stated time.\n")
+none_exit, none_out, none_err = run_main_captured(
+    [anchor_tx, "--summary", "readable-anchor-none.summary.md",
+     "-o", anchor_out])
+check("a summary citing no timestamps says so instead of scoring 100%",
+      none_exit is None and "no [H:MM:SS] anchors" in none_out
+      and "0 of 0" not in none_out, none_out)
+check("and is not warned about, since nothing was mis-cited",
+      none_err == "", none_err)
+
+# --transcript-only is piped into the summariser, so nothing but the
+# transcript may reach stdout — the count would land in the middle of it.
+to_exit, to_out, to_err = run_main_captured([anchor_tx, "--transcript-only"])
+check("--transcript-only still prints the transcript and nothing about anchors",
+      to_exit is None and "the 0th thing anyone said" in to_out
+      and "Summary anchors" not in to_out
+      and "resolve to a paragraph heading" not in to_out, to_out)
+
+check.section("a named, non-numeric cluster carries its caveat through main()")
+# The end-to-end version of the sniffing defect: diarize.one_label renders a
+# non-numeric id as "Wren Ashby (SPEAKER_MAIN)", which contains no "(Speaker "
+# for a sniff to find, so a sniffed document would caption a named transcript
+# as unnamed. This drives the real path — sidecar, names sidecar,
+# speaker_labels, paragraphs, render — rather than hand-built paragraphs.
+odd_tx = "readable-named-test.timestamped.txt"
+odd_out = "readable-named-test.readable.md"
+(OUTPUT_DIR / odd_tx).write_text(
+    "[00:00:00.00 --> 00:00:02.00]  opening the meeting\n"
+    "[00:00:02.00 --> 00:00:04.00]  and closing it again\n")
+(OUTPUT_DIR / "readable-named-test.speakers.json").write_text(
+    '{"turns": [{"start": 0.0, "end": 4.0, "speaker": "SPEAKER_MAIN"}]}')
+odd_names_file = "readable-named-test.names.json"
+(OUTPUT_DIR / odd_names_file).write_text(
+    '{"names": {"SPEAKER_MAIN": {"name": "Wren Ashby", '
+    '"confidence": "high", "basis": "introduces themselves"}}}')
+odd_summary = "readable-named-test.summary.md"
+(OUTPUT_DIR / odd_summary).write_text(
+    "## Executive summary\n\nWren Ashby opened at [0:00:00].\n")
+
+# --names alone, so the "--names implies --speakers" path and the bare sidecar
+# lookup are both exercised on the way through.
+odd_exit, _, _ = run_main_captured(
+    [odd_tx, "--names", odd_names_file, "--summary", odd_summary,
+     "-o", odd_out])
+odd_doc = (OUTPUT_DIR / odd_out).read_text()
+check("--names alone finds the speaker sidecar it implies", odd_exit is None,
+      odd_exit)
+check("the named, non-numeric cluster is labelled with both name and id",
+      "Wren Ashby (SPEAKER_MAIN)" in odd_doc, odd_doc)
+check("the assembled document gets the named caveat under the summary",
+      "speaker names are inferred" in odd_doc, odd_doc)
+check("not the 'acoustic clusters, not names' one a sniffed label would give it",
+      "acoustic clusters, not names" not in odd_doc, odd_doc)
+check("the transcript note says names were inferred too",
+      "Names in brackets were inferred" in odd_doc, odd_doc)
+check("no label in the document contains the substring the old sniff looked "
+      "for, so nothing could have made it right by accident",
+      "(Speaker " not in odd_doc, odd_doc)
+
+# The other half of the same fact: main() must pass the truth on every path,
+# and `names` is bound before the --speakers block for exactly that reason.
+spk_only_exit, _, _ = run_main_captured(
+    [odd_tx, "--speakers", "readable-named-test.speakers.json",
+     "--summary", odd_summary, "-o", odd_out])
+check("clusters without a names sidecar get the unnamed caveat, not a guess",
+      spk_only_exit is None
+      and "acoustic clusters, not names" in (OUTPUT_DIR / odd_out).read_text(),
+      spk_only_exit)
+try:
+    # Caught rather than allowed to propagate: if `names` is ever initialised
+    # inside `if args.speakers:` again, this path raises UnboundLocalError at
+    # `named=bool(names)`, and that is a failed check, not a broken suite.
+    unlabelled_exit, _, _ = run_main_captured(
+        [odd_tx, "--summary", odd_summary, "-o", odd_out])
+except Exception as e:
+    unlabelled_exit = f"{type(e).__name__}: {e}"
+check("a document with a summary and no --speakers at all still assembles: "
+      "main() knows the naming answer on every path",
+      unlabelled_exit is None, unlabelled_exit)
+check("and it says speakers are not labelled, because they are not",
+      "speakers are not labelled" in (OUTPUT_DIR / odd_out).read_text(),
+      (OUTPUT_DIR / odd_out).read_text())
 
 check.finish()

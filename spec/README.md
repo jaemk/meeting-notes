@@ -70,11 +70,14 @@ shell, and nothing in the suite runs `make` or `setup.sh`:
 - `GAP-12` — that amplifying an off-mic gap recovers nothing. A measured
   result on one recording, not a property a test can re-derive: reproducing it
   means a decode. `GAP-7` … `GAP-11`, the bucketing itself, *are* tested.
-- `DOC-10`'s wiring and `DOC-11`. `readable.py --transcript-only` is covered by
+- `DOC-10`'s wiring. `readable.py --transcript-only` is covered by
   `test_readable.py`; the `make readable` pipe that feeds it to Claude is a
-  Makefile recipe, and nothing checks that the summary's cited timestamps
-  resolve to headings in the document it was rendered beside. That check is
-  `DOC-11` and it is run by hand.
+  Makefile recipe. `DOC-11` used to belong in this list — the check that the
+  summary's cited timestamps resolve to headings in the document it was
+  rendered beside was run by hand. `DOC-13` moved it into `readable.py`, where
+  both halves are already in memory, and `test_readable.py` covers it; only the
+  visibility of the warning inside the `make readable` recipe is still verified
+  by reading.
 - `REPAIR-15` and `REPAIR-16` — how to read a repaired window. Statements about
   a reader's judgement rather than about code, so there is nothing to assert.
 - `VERIFY-2` … `VERIFY-7`. `VERIFY-1` is `repair.py verify` and is tested; the
@@ -84,6 +87,17 @@ shell, and nothing in the suite runs `make` or `setup.sh`:
 
 Treat those as documented intent that a change can break without turning the
 suite red. Reviewing them means reading the recipe.
+
+`SEAM-8`, `SEAM-9`, `VERIFY-8`, `COST-7`, `COST-8`, `FILES-11` … `FILES-15`,
+`DOC-12`, `DOC-13` and `DOC-14` are the exceptions to the bullets above them,
+and are called out because their neighbours are not tested. Each is asserted by
+`test_repair.py`, `test_transcribe.py` or `test_readable.py`.
+
+Two are worth naming individually. `VERIFY-8` sits among reader checks but is
+the one statement in that group a suite can enforce, because the evidence it
+protects is the backwards jump `repair.py verify` already counts. `COST-7` and
+`COST-8` are tested where `COST-1` … `COST-6` are read, because what they
+promise is a file on disk rather than a claim about how long a run takes.
 
 ## Conventions
 

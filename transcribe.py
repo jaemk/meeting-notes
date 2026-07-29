@@ -165,6 +165,87 @@ def resolve_output(stem):
     return OUTPUT_DIR / p.name
 
 
+def resolve_output_file(path, flag="--output"):
+    """
+    The same rule as resolve_output, for a --output that names a *file* rather
+    than a stem: a bare name lands in output/, anything with a directory
+    component (or an absolute path) is honoured where it was typed and is warned
+    about if it is somewhere git would commit it. The extension is left exactly
+    as given — this returns a path to write, not a stem to append to.
+
+    Deliberately a second function rather than a flag on resolve_output, because
+    the two --output arguments are different things. transcribe.py --output and
+    repair.py -o name a stem that save_output appends .txt / .timestamped.txt /
+    .srt to, so stripping a transcript extension off what was typed is what
+    keeps `-o notes.timestamped.txt` from writing
+    notes.timestamped.txt.timestamped.txt. The --output of readable.py,
+    diarize.py and names.py names the finished file itself, where that same
+    stripping silently renames it: `-o notes.txt` would write `notes`, a file
+    with no extension that the next stage's bare-name lookup no longer finds.
+    Keeping them apart forces each caller to say which kind of name it takes,
+    which is cheaper to read than one resolver with a mode flag.
+
+    Refuses anything that does not name an actual file to write — "", ".", or
+    a path ending in "/" (a directory, the same trap the Makefile's
+    need_output guard refuses a bare `output/` stem for: honouring it here
+    would open a directory for writing and fail late, mid-run, instead of
+    here); and a bare "..", which is not a directory itself but, joined onto
+    OUTPUT_DIR as every other bare name is, walks straight back out of it —
+    unlike "sub/.." it has no directory component, so it would skip the
+    warn_if_committable check every other escape from output/ goes through.
+
+    `flag` names the option the value arrived on. The same rule serves
+    --output, --speakers and --names, and a refusal that names the wrong one
+    sends the reader to a flag they did not type.
+    """
+    s = str(path)
+    if s.endswith("/"):
+        raise ValueError(
+            f"{flag} must name a file, not a directory: {path!r}"
+        )
+    p = Path(path)
+    if len(p.parts) > 1 or p.is_absolute():
+        # Expanded here, not just judged expanded: warn_if_committable judges
+        # the ~-expanded path but, before this, the path handed back was the
+        # unexpanded one, so whether "the warning's verdict" and "the path
+        # actually written to" agreed depended on where ~ happened to point.
+        # _resolve_in (the input-side equivalent) has the same gap and is not
+        # touched here — that is a wider inconsistency than this function
+        # should fix unilaterally.
+        p = p.expanduser()
+        warn_if_committable(p)
+        return p
+    if not p.name or p.name == "..":
+        # Path("").name and Path(".").name are both "" — nothing a file could
+        # be named. Path("..").name is not empty ("..") but is exactly as
+        # unusable: OUTPUT_DIR / ".." is OUTPUT_DIR's parent, not a file in
+        # output/, so it gets the same refusal even though it fails the
+        # emptiness check the other two do.
+        raise ValueError(f"{flag} must name a file: {path!r}")
+    return OUTPUT_DIR / p.name
+
+
+def resolve_output_file_arg(value, flag="--output"):
+    """
+    resolve_output_file for a value that came off a command line.
+
+    Same rule; what differs is what a refusal looks like. A path naming a
+    directory is an ordinary mistake made typing a flag, not a bug in the
+    program, so it earns a sentence and an exit rather than a traceback out of
+    the middle of a CLI — the line prompt.py takes about an unreadable
+    template, and require_file takes about a missing recording.
+
+    Kept apart from resolve_output_file rather than folded into it because the
+    rule and the reporting are different concerns: readable.py, diarize.py and
+    names.py all want the exit, and a caller that wants to handle the refusal
+    itself still can.
+    """
+    try:
+        return resolve_output_file(value, flag)
+    except ValueError as e:
+        raise SystemExit(str(e))
+
+
 def default_output(audio_path):
     """output/<audio name> — the recording's own name carries over to its transcript."""
     return OUTPUT_DIR / Path(audio_path).stem
@@ -1053,7 +1134,17 @@ def main():
         # Only rewrite the files if a window was actually spliced — a clean
         # transcript should not have its output touched a second time.
         if any(spliced for _, _, spliced, _, _ in report):
-            segments.sort(key=lambda s: (s["start"], s["end"]))
+            # Written in the order repair handed back, never re-sorted. splice()
+            # inserts at the position of the first segment it displaced and
+            # leaves everything else where it was, and the trims only drop and
+            # clamp, so the order coming out of the repair is already the order
+            # to write. A sort here would be a no-op on every in-order
+            # transcript and destructive on the one that is not: it re-interleaves
+            # a rewound block line-by-line into the speech it buried, and erases
+            # the backwards jump that was the only evidence the seam was never
+            # confirmed (SEAM-4, SEAM-8, VERIFY-3). On this path clamp_to_chunk
+            # has already made a rewind impossible (MERGE-2, MERGE-3), so there
+            # is nothing for it to fix even in principle.
             save_output({"text": rebuild_text(segments), "segments": segments},
                         output_path, args.timestamps)
 

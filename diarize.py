@@ -431,7 +431,8 @@ def cmd_run(args):
             and args.min_speakers > args.max_speakers):
         sys.exit("--min-speakers cannot exceed --max-speakers")
 
-    stem = args.output or str(T.resolve_output(audio.stem))
+    stem = (str(T.resolve_output_file_arg(args.output)) if args.output
+            else str(T.resolve_output(audio.stem)))
     out = sidecar_path(stem) if not str(stem).endswith(".json") else Path(stem)
 
     try:
@@ -482,7 +483,7 @@ def cmd_apply(args):
 
     stem = T.output_stem(path)
     if args.speakers:
-        speakers_file = T.resolve_output(args.speakers)
+        speakers_file = T.resolve_output_file_arg(args.speakers, "--speakers")
         tried = [speakers_file]
     else:
         speakers_file, tried = find_sidecar(stem)
@@ -499,7 +500,7 @@ def cmd_apply(args):
                       contested_ratio=args.contested_ratio)
     stats = summarise(assigned)
 
-    out = (T.resolve_output(args.output) if args.output
+    out = (T.resolve_output_file_arg(args.output) if args.output
            else Path(f"{stem}.speakers.md"))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render(assigned, document_title(stem), stats))

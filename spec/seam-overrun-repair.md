@@ -47,3 +47,34 @@ reason as `MERGE-3`.
 Trims are counted apart from decode windows in the repair summary. They cost no
 window and cannot come back dirty, so folding them in would flatter the decode
 success rate.
+
+## SEAM-8
+
+**The write path never re-sorts.** A transcript is written in the order the
+repair produced, and the splice position is the ordering authority: `splice`
+inserts each replacement where the segments it displaced were and leaves
+everything else untouched, and the two trims only drop and clamp. On a fresh
+transcription the question does not arise at all, because `clamp_to_chunk`
+(`MERGE-2`, `MERGE-3`) makes a rewind impossible before the segments are ever
+merged.
+
+So a global sort before saving is a no-op on every transcript that is in order,
+and destructive on exactly the one `SEAM-4` exists to protect: an unconfirmed
+seam, where the rewound tail is still in the file on purpose. Sorting it
+interleaves that tail line-by-line into the speech it buried — producing a
+passage that reads as though two people were alternating — and erases the
+backwards jump, which is the evidence `VERIFY-3` counts. Both write paths
+(`repair.py` and `transcribe.py`'s post-repair rewrite) shipped that sort, and a
+`verify` run after one reported "no defects found" on a scrambled transcript.
+
+## SEAM-9
+
+The rejected alternative was to keep the sort and gate it on
+`not seam_overruns(segments)` — sort only when there is no rewind to scramble.
+It is refused on three counts. The gate is true exactly when the sort changes
+nothing, so it turns the sort into dead code while leaving it there to be
+trusted. `seam_overruns` compares starts alone, so a transcript disordered only
+in its ends passes the gate and is re-sorted anyway. And it makes the bytes on
+disk depend on a detector with a tolerance, when the ordering is already known
+exactly by the code that produced it. Deleting is the smaller thing to reason
+about.

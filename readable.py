@@ -27,6 +27,7 @@ sidecar, so the deliverable never depends on the optional diarization install.
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -39,6 +40,26 @@ PARAGRAPH_PAUSE = 2.0
 # And a paragraph ends here regardless, so an unbroken monologue still arrives
 # in readable pieces.
 PARAGRAPH_WORDS = 110
+
+# How a summary refers to a place in the recording. summarize.md asks for
+# `[H:MM:SS]` and the anchors it is shown are bold — `**[0:12:34]**` — so a
+# citation comes back bare, in backticks, inside a table cell or still bolded.
+# Only the brackets and the clock inside them are matched: whatever wraps them
+# is markdown, and insisting on one wrapping would report a perfectly good
+# citation as a miss.
+CITATION = re.compile(r"\[(\d{1,2}:\d{2}:\d{2})\]")
+
+# Warn when fewer than this share of the summary's citations land on a heading.
+# The two states ever observed are ~100% (summary and document rendered from
+# the same paragraphs, which is what `--transcript-only` exists to guarantee)
+# and 20% (the summary written from the raw .timestamped.txt, citing segment
+# times that are not headings — see DOC-10 and the `readable:` recipe). Nothing
+# legitimate sits between them, so this only has to separate them: 0.9 is far
+# enough under 100% that one stale anchor in a hand-edited summary of any size
+# does not cry wolf, and far enough over 20% that the wiring defect trips it
+# every time. A finer ratio would be pretending to a precision the measurement
+# does not have.
+ANCHOR_WARN = 0.9
 
 
 def fmt_clock(seconds):
@@ -131,6 +152,38 @@ def transcript_lines(paras):
     return lines
 
 
+def cited_anchors(summary, paras):
+    """
+    Which `[H:MM:SS]` the summary cites, and which of them resolve to nothing.
+
+    Returns `(cited, missing)`: every distinct citation in the order the
+    summary makes them, and the subset that is not a paragraph heading in
+    `paras`. Distinct, because the question is how many places the summary
+    sends the reader to, not how many sentences mention one — a summary that
+    cites its one good anchor six times is not six times healthier, and one
+    that repeats a bad anchor is not six defects.
+
+    The comparison is against `fmt_clock` of each paragraph's start, which is
+    the same call `transcript_lines` makes to write the heading, so a citation
+    can only fail to resolve for a real reason rather than because two
+    formatters drifted apart. It is exact on purpose: `[00:12:34]` with a
+    padded hour, or `[0:12:30]` rounded off a paragraph that starts at
+    0:12:34, is a string the reader cannot find in the document, and calling
+    it close enough here is exactly the leniency that leaves them searching.
+
+    This is a measurement, not a gate. What the caller does with it is print
+    it — see main(), and DOC-13 for why a bad citation must not fail an
+    assembly.
+    """
+    anchors = {fmt_clock(p[0]) for p in paras}
+    cited, seen = [], set()
+    for clock in CITATION.findall(summary or ""):
+        if clock not in seen:
+            seen.add(clock)
+            cited.append(clock)
+    return cited, [c for c in cited if c not in anchors]
+
+
 def write_piped(text, stream=None):
     """
     Write to stdout, tolerating a reader that stops early.
@@ -157,8 +210,20 @@ def write_piped(text, stream=None):
         raise SystemExit(0)
 
 
-def render(segments, title, summary=None, paras=None, corrections=None):
-    """The whole document: heading, what it is, the summary, the transcript."""
+def render(segments, title, summary=None, paras=None, corrections=None,
+           named=None):
+    """
+    The whole document: heading, what it is, the summary, the transcript.
+
+    `named` says whether speaker labels carry inferred names, for the
+    disclosure caveat under the summary and under "Full transcript". Pass it
+    explicitly — main() knows whether a names sidecar was loaded, before any
+    label is turned into display text. Left as None (the default, for a
+    caller that supplies its own `paras` and no opinion on the question) it
+    falls back to a best-effort sniff of the rendered labels; see the comment
+    below for why that fallback is not trustworthy and should not be relied
+    on by anything that can do better.
+    """
     words = sum(len(s["text"].split()) for s in segments)
     # Not segments[-1]["end"]: a transcript with an unrepaired rewind (see
     # `paragraphs` above) does not end at its highest timestamp, so the
@@ -171,9 +236,19 @@ def render(segments, title, summary=None, paras=None, corrections=None):
     if paras is None:
         paras = paragraphs(segments)
     labelled = any(len(p) > 2 and p[2] for p in paras)
-    # A name renders as "Robin (Speaker 7)", so a bracket after a label is
-    # what distinguishes a named document from a numbered one.
-    named = any(len(p) > 2 and p[2] and "(Speaker " in p[2] for p in paras)
+    if named is None:
+        # Best-effort only, for a caller that hands render() its own paras
+        # without saying whether they are named (see DOC-12). Sniffing
+        # "(Speaker " out of the rendered label is not reliable: a cluster id
+        # is not guaranteed to be numeric — one_label renders a non-numeric
+        # id as e.g. "Robin (SPEAKER_MAIN)", which does not contain "(Speaker
+        # " even though the document is named — and a label reaching here may
+        # already have been rewritten by --glossary (readable.py's glossary
+        # branch, applied to labels as well as bodies), a second and
+        # independent way the rendered text can stop matching the fact it is
+        # being used to infer. main() passes the true answer explicitly
+        # instead of relying on this.
+        named = any(len(p) > 2 and p[2] and "(Speaker " in p[2] for p in paras)
 
     if summary:
         if named:
@@ -301,6 +376,11 @@ examples:
     title = args.title or document_title(stem)
 
     labels = None
+    # Bound here rather than inside the --speakers branch below, and it has to
+    # stay here: render() is called with named=bool(names) on every path,
+    # including the one where no sidecar was asked for, and binding it in the
+    # branch makes that an UnboundLocalError on the commonest run of all.
+    names = None
     # Naming clusters is meaningless without the clusters, so --names turns
     # --speakers on rather than failing on a combination the user plainly
     # meant.
@@ -318,7 +398,7 @@ examples:
                 sys.exit(f"No speaker sidecar. Looked for:\n{looked}\n"
                          f"Run it first:  ./diarize.py run <audio>")
         else:
-            sidecar = T.resolve_output(args.speakers)
+            sidecar = T.resolve_output_file_arg(args.speakers, "--speakers")
             if not sidecar.exists():
                 sys.exit(f"No speaker sidecar at {sidecar}")
         try:
@@ -326,7 +406,6 @@ examples:
         except ValueError as e:
             sys.exit(f"Can't read {sidecar}: {e}")
 
-        names = None
         if args.names:
             import names as N
             if args.names is True:
@@ -336,7 +415,7 @@ examples:
                     sys.exit(f"No names sidecar. Looked for:\n{looked}\n"
                              f"Build one first:  make names INPUT=<audio>")
             else:
-                names_file = T.resolve_output(args.names)
+                names_file = T.resolve_output_file_arg(args.names, "--names")
                 if not names_file.exists():
                     sys.exit(f"No names sidecar at {names_file}")
             try:
@@ -402,10 +481,11 @@ examples:
 
     # Same rule as everything else this repo writes: a bare name lands in
     # output/, a path with a directory in it is used as given.
-    out = T.resolve_output(args.output) if args.output else Path(f"{stem}.readable.md")
+    out = (T.resolve_output_file_arg(args.output) if args.output
+           else Path(f"{stem}.readable.md"))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render(segments, title, summary, paras=paras,
-                          corrections=corrections))
+                          corrections=corrections, named=bool(names)))
 
     print(f"Saved: {out}  ({len(paras)} paragraphs"
           f"{', with summary' if summary else ', no summary'}"
@@ -413,6 +493,44 @@ examples:
     if args.glossary:
         import glossary as G
         print(f"  {G.summarise(corrections)}")
+
+    # Both halves are in hand here — the summary's text and the paragraph list
+    # the document is being built from — so checking that the summary's
+    # cross-references land on headings that exist costs nothing. DOC-11 said
+    # this was checked by comparing the two files afterwards; it is checked
+    # here now, and reported.
+    #
+    # Reported, never enforced. A summary is the one artefact in this pipeline
+    # that costs money, takes minutes and is worth hand-editing, and a
+    # timestamp is a navigation aid: refusing to assemble the document over one
+    # would throw away the expensive thing to protect the cheap one, and leave
+    # the reader with no document at all rather than one with a link that does
+    # not go anywhere. Same posture as `--speakers` and the gap classifier —
+    # say what was measured and let the person decide.
+    if summary:
+        cited, missing = cited_anchors(summary, paras)
+        if not cited:
+            print("  Summary cites no [H:MM:SS] anchors — nothing to check")
+        else:
+            resolved = len(cited) - len(missing)
+            print(f"  Summary anchors: {resolved} of {len(cited)} cited "
+                  f"timestamps resolve to a paragraph heading")
+            if resolved < ANCHOR_WARN * len(cited):
+                # stderr, unlike the line above: this survives a redirected
+                # stdout and stands out in `make readable`'s output, which is
+                # where the failure it names was found and missed.
+                examples = ", ".join(f"[{c}]" for c in missing[:3])
+                more = f" and {len(missing) - 3} more" if len(missing) > 3 else ""
+                sys.stderr.write(
+                    f"WARNING: only {resolved} of {len(cited)} timestamps the "
+                    f"summary cites are headings in this document "
+                    f"({examples}{more} are not). A summary written from the "
+                    f"raw transcript cites segment times rather than "
+                    f"paragraph headings; re-run the summary step from "
+                    f"`readable.py --transcript-only` with the same "
+                    f"--speakers/--names/--glossary flags as this run. The "
+                    f"document was written anyway — the transcript below it "
+                    f"is unaffected.\n")
 
 
 if __name__ == "__main__":

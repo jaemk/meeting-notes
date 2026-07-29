@@ -314,7 +314,9 @@ def _load(args):
 def cmd_gather(args):
     segments, turns, stem = _load(args)
     candidates, shapes = gather(segments, turns)
-    out = (T.resolve_output(args.output) if args.output
+    # --output names the candidates file itself, not a stem to append an
+    # extension to — resolve_output_file is the one place that rule lives.
+    out = (T.resolve_output_file_arg(args.output) if args.output
            else Path(f"{stem}.names-candidates.json"))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(
@@ -352,7 +354,9 @@ def cmd_ingest(args):
     except ValueError as e:
         sys.exit(f"Refusing to write the names sidecar: {e}")
 
-    out = (T.resolve_output(args.output) if args.output
+    # Same reasoning as cmd_gather: this --output names the sidecar file,
+    # so it goes through resolve_output_file rather than resolve_output.
+    out = (T.resolve_output_file_arg(args.output) if args.output
            else Path(f"{stem}.names.json"))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({"names": clean}, indent=1))

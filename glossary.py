@@ -58,7 +58,7 @@ def parse(text):
     it says would corrupt every document built from it, in a way no reader
     could detect from the output.
     """
-    mapping, seen, out = {}, {}, []
+    mapping, seen = {}, {}
     for lineno, raw in enumerate(text.splitlines(), 1):
         line = raw.split("#", 1)[0].strip()
         if not line:
@@ -105,7 +105,6 @@ def parse(text):
                 f"never match anything")
         mapping.setdefault(correct, [])
         mapping[correct].extend(variants)
-        out.append(correct)
     return mapping
 
 
@@ -157,14 +156,24 @@ def apply(text, rules):
     return pattern.sub(swap, text), counts
 
 
-def load(path):
-    """Parse a glossary file into compiled rules."""
+def _read(path):
+    """
+    A glossary's text, or a GlossaryError naming the path.
+
+    One implementation of the read-and-wrap, not two that can drift apart —
+    `load` and `main` both need it, and `main` also needs the parsed mapping
+    that `load` throws away. Same reasoning as diarize.find_sidecar.
+    """
     p = Path(path)
     try:
-        text = p.read_text(encoding="utf-8")
+        return p.read_text(encoding="utf-8")
     except OSError as e:
         raise GlossaryError(f"can't read {p}: {e}") from e
-    return compile_rules(parse(text))
+
+
+def load(path):
+    """Parse a glossary file into compiled rules."""
+    return compile_rules(parse(_read(path)))
 
 
 def find(stem=None):
@@ -211,10 +220,10 @@ def main():
     args = ap.parse_args()
 
     try:
-        rules = load(args.glossary)
+        mapping = parse(_read(args.glossary))
     except GlossaryError as e:
         sys.exit(f"Refusing this glossary: {e}")
-    mapping = parse(Path(args.glossary).read_text(encoding="utf-8"))
+    rules = compile_rules(mapping)
     total = sum(len(v) for v in mapping.values())
     print(f"{args.glossary}: {len(mapping)} spellings, {total} variants")
 

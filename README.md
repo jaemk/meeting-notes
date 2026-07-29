@@ -410,7 +410,7 @@ defaults. See [Commands](#commands).
 
     make test
 
-813 checks across seven suites. Transcription is stubbed, so the tests need no
+931 checks across seven suites. Transcription is stubbed, so the tests need no
 model, no network and no GPU, and finish in seconds. The speaker tests don't
 need the optional diarization install either.
 

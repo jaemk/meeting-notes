@@ -329,6 +329,21 @@ if _cand_out.exists():
     check("every cluster in the sidecar is described for the prompt",
           set(_payload["clusters"]) == {"SPEAKER_00", "SPEAKER_01"})
 
+# --output names a file, not a stem — resolve_output_file must not strip or
+# otherwise alter the extension that was typed.
+_named_out = OUTPUT_DIR / "names-cli-extension.json"
+_r = cli("gather", str(FIXTURE.path), "--output", "names-cli-extension.json")
+check("gather -o <name>.json writes exactly that file under output/, "
+      "extension intact",
+      _r.returncode == 0 and _named_out.exists(),
+      (_r.stderr[-400:], _named_out))
+
+_bare_out = OUTPUT_DIR / "names-cli-bare"
+_r = cli("gather", str(FIXTURE.path), "--output", "names-cli-bare")
+check("a bare gather -o <name> still lands in output/",
+      _r.returncode == 0 and _bare_out.exists(),
+      (_r.stderr[-400:], _bare_out))
+
 _names_out = OUTPUT_DIR / "names-cli.names.json"
 # The quote is lifted out of the fixture rather than made up, because ingest
 # now checks it against the transcript (NAME-22). An invented one belongs in

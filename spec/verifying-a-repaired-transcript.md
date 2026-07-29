@@ -59,3 +59,14 @@ every 0.84 seconds is a decoder stuck in a cycle rather than a person repeating
 themselves; real repetition is irregularly spaced. Spacing is not part of
 `DETECT-2`, which compares text alone, so this is a reading check and not a
 detector rule.
+
+## VERIFY-8
+
+**Nothing on the write path may erase a backwards jump.** The jump is not a
+formatting defect to be tidied up on the way to disk; it is the evidence
+`VERIFY-3` counts, and the only trace an unconfirmed seam (`SEAM-4`) leaves
+behind. A step that reorders segments while writing them removes the symptom and
+keeps the damage, so the count comes back zero on a transcript that is worse
+than it was — and `VERIFY-2` … `VERIFY-7` are all run against the written file.
+This is why `SEAM-8` states the rule as a property of the write path rather than
+leaving it to whoever next finds a transcript out of order.

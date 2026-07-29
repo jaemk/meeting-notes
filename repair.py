@@ -974,6 +974,156 @@ def require_file(path, resolver, directory, kind):
     return resolved
 
 
+# The three renderings save_output writes from one stem. Named once because two
+# things have to agree about them: what a backup copies, and what the guard
+# below refuses to overwrite. A list that drifted between the two would leave a
+# file copied that nothing guards, or guarded that nothing copies.
+BACKED_UP_EXTS = (".txt", ".timestamped.txt", ".srt")
+
+
+def backup_pairs(stem):
+    """
+    (source, backup) for every file an --in-place repair rewrites and that is
+    really on disk, in the order they are written.
+
+    Only the siblings that exist are listed. A stem whose .srt was deleted, or
+    that was written under --no-timestamps, should not leave an empty .srt.bak
+    behind: a backup of nothing is indistinguishable from a backup of a file
+    that really was empty, and `make clean` would sweep it up either way.
+
+    The backup is `<file>.bak`, which is exactly what T.backup_file produces —
+    every one of these names has an extension, so appending to the string and
+    appending to the final suffix are the same name. That shape is deliberate
+    and is not free to change: `.gitignore` keeps transcripts out of a commit by
+    what a file *is* (`*.bak`, FILES-9) and `make clean` sweeps this recording's
+    backups with `$(OUTPUT).*.bak`. A numbered generation — `.bak.1` — matches
+    neither, so it would be both committable and immune to `clean`. That is
+    half the argument for keeping one generation (FILES-12); COST-8 is the
+    other half.
+    """
+    pairs = []
+    for ext in BACKED_UP_EXTS:
+        src = Path(str(stem) + ext)
+        if src.exists():
+            pairs.append((src, Path(str(src) + ".bak")))
+    return pairs
+
+
+def backup_outputs(stem):
+    """
+    Copy every file --in-place is about to overwrite. Returns the backups made,
+    in the order they were written.
+
+    save_output writes .txt, .timestamped.txt and .srt from one stem, so backing
+    up only the transcript that was named on the command line leaves the other
+    two overwritten with nothing to restore them from — and what they hold cost
+    hours of decoding that no amount of re-running the repair brings back
+    (COST-7). The three are one document in three renderings; recovering the
+    timestamped one and not the SRT is not a recovery.
+
+    One generation, and only one: T.backup_file writes `<file>.bak`
+    unconditionally, so calling this twice over the same stem puts the second
+    run's input — already repaired — where the original decode was. Nothing
+    here stops that, because by the time a backup is taken the repair has
+    already run; the refusal lives in check_backup_generation, which is called
+    before anything is decoded.
+    """
+    made = []
+    for src, _ in backup_pairs(stem):
+        # T.backup_file, not a local copy2: it pins UTF-8 on both ends, and
+        # a mangled backup of a transcript is worse than none at all.
+        made.append(T.backup_file(src))
+    return made
+
+
+def existing_backups(stem):
+    """
+    The .bak files an --in-place run would overwrite. Empty on a stem that has
+    never been repaired in place.
+
+    Only a backup whose own source is still there counts. backup_outputs copies
+    the siblings that exist and nothing else, so a stale `.srt.bak` left beside
+    a stem whose .srt has since been deleted is in no danger from this run, and
+    refusing on it would stop a run that endangers nothing.
+    """
+    return [bak for _, bak in backup_pairs(stem) if bak.exists()]
+
+
+def check_write_target(in_place, output, replace_backup=False):
+    """
+    Reject a pair of flags that name two different files (FILES-13).
+
+    --in-place means "overwrite the transcript I passed in"; --output means
+    "write somewhere else and leave it alone". Asked for both, the run used to
+    do half of each: the write went to the --output stem while backup_outputs
+    keyed on the source transcript, so it copied three files nothing was about
+    to overwrite and overwrote files it had copied nothing from. Neither half is
+    wrong on its own, which is why nothing complained.
+
+    An argparse mutually-exclusive group would refuse the same combination in
+    one line, and it is rejected for what it can say: "argument --output/-o: not
+    allowed with argument --in-place" names the two flags and stops, leaving the
+    user to guess whether this is a rule or a hazard. Every other refusal in
+    this repo says what the incoherent setting would have done — check_settings
+    above, diarize's --num-speakers guard — because the message is the only
+    place a user finds out what they were about to lose.
+    """
+    if in_place and output:
+        fail("--in-place and --output name different files, so asking for both "
+             "is asking for two repairs at once. --in-place overwrites the "
+             "transcript you passed in, copying each file it rewrites to a .bak "
+             "first; --output writes a fresh stem and leaves the original where "
+             "it is. Given both, the repair lands on the --output stem while the "
+             ".bak is taken of the source — files backed up that nothing "
+             "overwrites, and files overwritten that nothing was backed up. Pass "
+             "--output alone to keep the original, or --in-place alone to "
+             "replace it")
+    if replace_backup and not in_place:
+        fail("--replace-backup has no backup to replace without --in-place — "
+             "that is the only mode that writes a .bak at all. On its own this "
+             "asks to give up a copy this run was never going to make, which "
+             "reads as protection against something that is not happening")
+
+
+def check_backup_generation(stem, replace_backup=False):
+    """
+    Refuse a second --in-place repair over the .bak the first one left behind.
+
+    T.backup_file writes `<file>.bak` unconditionally, so run two of --in-place
+    copies run one's *repaired* output over the only copy of the original
+    decode. What is lost is not a previous edit but hours of compute that
+    nothing short of the audio can produce again (COST-8) — thrown away by a
+    command spelled exactly like the one that saved it, and reported as "Backed
+    up original" while it happens.
+
+    Three other resolutions were considered and are written up in FILES-12:
+    numbered generations (`.bak.1`), which no ignore rule and no `make clean`
+    glob matches; detecting whether the .bak *would* be overwritten with
+    repaired content, which cannot be told from an idempotent repair; and
+    documenting the loss instead of preventing it, which leaves the failure one
+    keystroke away.
+
+    Called before the transcript is even loaded, and so long before anything is
+    decoded. The backup itself is taken after the repair has run — a refusal
+    arriving there would already have spent every decode the run was going to
+    spend, which is the cost this exists to protect.
+    """
+    if replace_backup:
+        return
+    found = existing_backups(stem)
+    if not found:
+        return
+    fail("refusing to repair in place over the backup an earlier one left: "
+         + ", ".join(str(p) for p in found)
+         + ". Those hold the transcript as it was before that repair, and this "
+           "run would copy the already-repaired files over them — the original "
+           "decode would then exist nowhere, and only the audio could produce it "
+           "again. Write this repair to its own stem with --output, which leaves "
+           "both the transcript and its .bak alone; or move the .bak files "
+           "somewhere safe; or pass --replace-backup to say you meant to give up "
+           "the older copy")
+
+
 def check_settings(min_run, min_gap, passes, gate=DEFAULT_GATE):
     """
     Reject thresholds that ask for something incoherent. Each of these looks
@@ -1059,7 +1209,18 @@ re-decoded. Either way it is the same splice-and-recheck path.
                    help="Coalesce defects closer than this into one window (default: 5)")
     r.add_argument("--output", "-o", default=None, help="Output stem")
     r.add_argument("--in-place", action="store_true",
-                   help="Overwrite the source transcript (a .bak is saved first)")
+                   help="Overwrite the source transcript. Every file this "
+                        "rewrites — .txt, .timestamped.txt and .srt — is copied "
+                        "to a .bak alongside it first. One generation: a repair "
+                        "over a stem that already has a .bak is refused, since "
+                        "that .bak is the only pre-repair copy, unless you pass "
+                        "--replace-backup")
+    r.add_argument("--replace-backup", action="store_true",
+                   help="Let an in-place repair overwrite the .bak an earlier "
+                        "one left. That .bak holds the transcript before that "
+                        "repair; replacing it with the current, already-repaired "
+                        "file means the original decode is gone and only the "
+                        "audio can produce it again")
     r.add_argument("--strict", action="store_true",
                    help="Only splice a window if it comes back completely clean")
     r.add_argument("--passes", type=int, default=2,
@@ -1073,6 +1234,12 @@ re-decoded. Either way it is the same splice-and-recheck path.
     add_common(v)
 
     args = ap.parse_args()
+    # Flags that contradict each other first, thresholds after: getattr because
+    # only `repair` has anywhere to write, and a guard that assumed otherwise
+    # would turn `verify` into a traceback.
+    check_write_target(getattr(args, "in_place", False),
+                       getattr(args, "output", None),
+                       getattr(args, "replace_backup", False))
     gate = gate_from_args(args)
     check_settings(args.min_run, args.min_gap, getattr(args, "passes", 1), gate)
     # Audio comes from local/, transcripts from output/ — a bare name on the
@@ -1082,6 +1249,15 @@ re-decoded. Either way it is the same splice-and-recheck path.
     if getattr(args, "audio", None):
         args.audio = require_file(args.audio, T.resolve_input,
                                   T.INPUT_DIR, "audio file")
+    # Before the transcript is loaded, let alone decoded. The .bak this protects
+    # is only written at the end of the run, so a refusal raised there would
+    # arrive after every decode had been spent — and the whole reason the copy
+    # is worth protecting is what those decodes cost (COST-8). A dry run reaches
+    # nothing: it writes no output and takes no backup, so it has nothing to
+    # overwrite and is not made to argue for itself.
+    if args.cmd == "repair" and args.in_place and not args.dry_run:
+        check_backup_generation(T.output_stem(args.transcript),
+                                args.replace_backup)
     segments = T.load_timestamped(args.transcript)
     targets = REPAIRABLE_KINDS if args.include_gaps else REPETITION_KINDS
 
@@ -1118,9 +1294,42 @@ re-decoded. Either way it is the same splice-and-recheck path.
             else T.output_stem(args.transcript) if args.in_place
             else Path(str(T.output_stem(args.transcript)) + ".repaired"))
     if args.in_place:
-        print(f"\nBacked up original: {T.backup_file(args.transcript)}")
+        # Keyed on the source transcript's own stem rather than on `stem`: it is
+        # the file that was passed in that --in-place puts at risk, and the three
+        # siblings save_output writes from it go together. `stem` cannot differ
+        # from it any more — check_write_target refuses --output here — but the
+        # two are still written apart, because the bug that cost a backup was
+        # exactly the assumption that they were the same thing.
+        source = T.output_stem(args.transcript)
+        # Read before the copy, which is the only moment it can be read: after
+        # backup_outputs every one of these exists whether it did or not.
+        replaced = existing_backups(source)
+        made = backup_outputs(source)
+        if made:
+            print("\nBacked up original: "
+                  + ", ".join(str(p) for p in made))
+        else:
+            print("\nNothing to back up — no .txt, .timestamped.txt or .srt "
+                  f"exists at {source}.")
+        # Only reachable with --replace-backup, since check_backup_generation
+        # stopped the run otherwise. Said out loud all the same: what has just
+        # been given up is the state before an earlier repair, which is the
+        # decode itself, and a run that takes it silently is the failure this
+        # whole guard is about.
+        if replaced:
+            print("⚠ Replaced the backup an earlier in-place repair left: "
+                  + ", ".join(str(p) for p in replaced)
+                  + ". Each now holds this run's input, not the original "
+                    "decode — that copy is gone.")
 
-    segments.sort(key=lambda s: (s["start"], s["end"]))
+    # Written in the order the repair produced, never re-sorted — see SEAM-8.
+    # T.splice inserts each replacement where the segments it displaced were and
+    # leaves the rest of the list untouched; trim_seams and trim_tail only drop
+    # and clamp. So the order here is already correct, and a global sort would
+    # be a no-op on every in-order transcript and destructive on exactly the one
+    # SEAM-4 protects: a transcript with an unconfirmed seam, whose rewound tail
+    # a sort shuffles line-by-line into the real speech underneath it while
+    # erasing the backwards jump that `verify` counts as the evidence (VERIFY-3).
     T.save_output({"text": T.rebuild_text(segments), "segments": segments}, stem, True)
     # Exit 0 — the repair itself succeeded and the output is written. Anything
     # it could not fix is reported above; `verify` is the pass/fail gate.
